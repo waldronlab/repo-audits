@@ -1,0 +1,228 @@
+name: Audit Single Repo Funding
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: >
+          Repository name within the waldronlab organisation to audit
+          (e.g. MultiAssayExperiment)
+        required: true
+        type: string
+      dry_run:
+        description: >
+          Dry run – perform all checks and show what would change,
+          but do NOT push branches, commits, or open PRs
+        required: false
+        type: boolean
+        default: false
+
+env:
+  ORG: waldronlab
+
+jobs:
+  audit-funding:
+    runs-on: ubuntu-latest
+    # No write permission needed in this (repo-audits) repo.
+    # All writes go to the TARGET repo via AUDIT_PAT.
+    permissions:
+      contents: read
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout repo-audits so scripts/ and nih_institutes.json are available
+      # -----------------------------------------------------------------------
+      - name: Checkout repo-audits
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 2. Set up R and install required packages
+      # -----------------------------------------------------------------------
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: release
+
+      - name: Install R packages
+        shell: Rscript {0}
+        run: |
+          options(repos = c(CRAN = "https://p3m.dev/cran/__linux__/noble/latest"))
+          install.packages(c("desc", "jsonlite"))
+
+      # -----------------------------------------------------------------------
+      # 3. Check repo eligibility and collect grant topics
+      # -----------------------------------------------------------------------
+      - name: Check eligibility and collect grant topics
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+
+          echo "==> Auditing ${ORG}/${REPO} …"
+
+          # --- Fetch repo metadata -------------------------------------------
+          if ! REPO_JSON=$(gh api "repos/${ORG}/${REPO}" 2>&1); then
+            echo "::error::Repository ${ORG}/${REPO} not found or not accessible."
+            exit 1
+          fi
+
+          IS_FORK=$(echo "${REPO_JSON}"     | jq -r '.fork')
+          IS_ARCHIVED=$(echo "${REPO_JSON}" | jq -r '.archived')
+
+          if [ "${IS_FORK}" = "true" ]; then
+            echo "::notice::Skipping ${REPO} – it is a fork."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [ "${IS_ARCHIVED}" = "true" ]; then
+            echo "::notice::Skipping ${REPO} – it is archived."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # --- Require devel branch ------------------------------------------
+          if ! gh api "repos/${ORG}/${REPO}/branches/devel" > /dev/null 2>&1; then
+            echo "::notice::Skipping ${REPO} – no 'devel' branch found."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # --- Require DESCRIPTION on devel ----------------------------------
+          if ! gh api "repos/${ORG}/${REPO}/contents/DESCRIPTION?ref=devel" \
+               > /dev/null 2>&1; then
+            echo "::notice::Skipping ${REPO} – no DESCRIPTION file on devel branch."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # --- Collect grant topics ------------------------------------------
+          TOPICS=$(gh api "repos/${ORG}/${REPO}/topics" \
+                     --header "Accept: application/vnd.github.mercy-preview+json" \
+                     --jq '.names[]' 2>/dev/null || true)
+
+          GRANTS=$(echo "${TOPICS}" \
+                   | grep -iE '^(u24|r01)[a-z]{2}[0-9]{6,}$' \
+                   | tr '[:lower:]' '[:upper:]' \
+                   | paste -sd ',' - \
+                   || true)
+
+          if [ -z "${GRANTS}" ]; then
+            echo "::notice::Skipping ${REPO} – no recognised grant topics (U24/R01) found."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "==> Found grant topic(s): ${GRANTS}"
+          echo "skip=false"          >> "${GITHUB_OUTPUT}"
+          echo "grants=${GRANTS}"    >> "${GITHUB_OUTPUT}"
+
+      # -----------------------------------------------------------------------
+      # 4. Fetch DESCRIPTION and run the R audit script
+      # -----------------------------------------------------------------------
+      - name: Fetch DESCRIPTION and update Authors@R
+        id: update
+        if: steps.check.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          GRANTS: ${{ steps.check.outputs.grants }}
+          NIH_INSTITUTES_JSON: ${{ github.workspace }}/scripts/nih_institutes.json
+          DESCRIPTION_PATH: /tmp/DESCRIPTION
+          OUTPUT_PATH: /tmp/DESCRIPTION_updated
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+
+          # Fetch DESCRIPTION from devel
+          gh api "repos/${ORG}/${REPO}/contents/DESCRIPTION?ref=devel" \
+            --jq '.content' | base64 -d > /tmp/DESCRIPTION
+
+          echo "==> Running R audit script …"
+          Rscript "${{ github.workspace }}/scripts/audit_single_repo.R"
+
+          if [ -f /tmp/DESCRIPTION_updated ]; then
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+            echo "==> DESCRIPTION needs updating."
+          else
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            echo "==> No changes needed."
+          fi
+
+      # -----------------------------------------------------------------------
+      # 5a. Create branch, commit and open PR (real run)
+      # -----------------------------------------------------------------------
+      - name: Create branch and open PR
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          steps.update.outputs.changed == 'true' &&
+          inputs.dry_run == false
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          GRANTS: ${{ steps.check.outputs.grants }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+          BRANCH="funding/add-fnd-authors-r-${{ github.run_id }}"
+
+          # Get the current devel SHA
+          DEVEL_SHA=$(gh api "repos/${ORG}/${REPO}/branches/devel" \
+                        --jq '.commit.sha')
+
+          # Create new branch off devel
+          gh api "repos/${ORG}/${REPO}/git/refs" \
+            --method POST \
+            --field "ref=refs/heads/${BRANCH}" \
+            --field "sha=${DEVEL_SHA}"
+
+          # Get the existing DESCRIPTION file SHA (required for update)
+          FILE_SHA=$(gh api "repos/${ORG}/${REPO}/contents/DESCRIPTION?ref=devel" \
+                       --jq '.sha')
+
+          # Base64-encode the updated content (no line wrapping)
+          CONTENT=$(base64 -w 0 /tmp/DESCRIPTION_updated)
+
+          # Commit the updated DESCRIPTION
+          gh api "repos/${ORG}/${REPO}/contents/DESCRIPTION" \
+            --method PUT \
+            --field "message=Add missing fnd entries to Authors@R in DESCRIPTION" \
+            --field "content=${CONTENT}" \
+            --field "sha=${FILE_SHA}" \
+            --field "branch=${BRANCH}"
+
+          # Build a human-readable grant list for the PR body
+          GRANT_LIST=$(echo "${GRANTS}" | tr ',' '\n' | sed 's/^/- /')
+
+          # Open PR against devel
+          gh pr create \
+            --repo "${ORG}/${REPO}" \
+            --base devel \
+            --head "${BRANCH}" \
+            --title "Add missing funder entries to Authors@R in DESCRIPTION" \
+            --body "$(printf 'This automated PR adds missing \`fnd\` (funder) entries to the \`Authors@R\` field in \`DESCRIPTION\` based on the following grant topics set on this repository:\n\n%s\n\nOpened by the [repo-audits](https://github.com/waldronlab/repo-audits) workflow (run [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})).' "${GRANT_LIST}")"
+
+          echo "::notice::PR created in ${ORG}/${REPO} targeting devel (branch: ${BRANCH})."
+
+      # -----------------------------------------------------------------------
+      # 5b. Dry-run summary
+      # -----------------------------------------------------------------------
+      - name: Dry-run summary
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          steps.update.outputs.changed == 'true' &&
+          inputs.dry_run == true
+        run: |
+          echo "::notice::DRY RUN – changes are needed in ${{ inputs.repo }} but no PR was created."
+          echo "==> Preview of updated DESCRIPTION:"
+          cat /tmp/DESCRIPTION_updated
+
+      # -----------------------------------------------------------------------
+      # 5c. Nothing to do
+      # -----------------------------------------------------------------------
+      - name: No changes needed
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          steps.update.outputs.changed == 'false'
+        run: |
+          echo "::notice::${{ inputs.repo }} is already up to date – all fnd entries present."
