@@ -1,0 +1,240 @@
+name: Audit All Repos Funding
+
+# Discovers every waldronlab R repository that carries a recognised grant topic
+# (U24 / R01) and opens a pull request in each one when fnd (funder) entries
+# are missing from Authors@R in DESCRIPTION.
+#
+# Repository discovery is performed in a dedicated `find-repos` job that uses
+# the BiocReporting package (account_repositories, filter_r_repos) so we can
+# re-use the existing, well-tested code rather than reimplementing it in bash.
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: >
+          Dry run – perform all checks and show what would change,
+          but do NOT push branches, commits, or open PRs
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    # Run every Monday at 08:00 UTC
+    - cron: '0 8 * * 1'
+
+env:
+  ORG: waldronlab
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Job 1 – discover eligible repositories using BiocReporting
+  # ---------------------------------------------------------------------------
+  find-repos:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.find.outputs.matrix }}
+
+    steps:
+      - name: Checkout repo-audits
+        uses: actions/checkout@v4
+
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: release
+
+      - name: Install R packages
+        shell: Rscript {0}
+        run: |
+          options(repos = c(CRAN = "https://p3m.dev/cran/__linux__/noble/latest"))
+          install.packages(c("BiocManager", "jsonlite"))
+          # BiocReporting lives on GitHub; BiocManager resolves Bioconductor deps
+          BiocManager::install("Bioconductor/BiocReporting", update = FALSE, ask = FALSE)
+
+      - name: Find eligible repositories
+        id: find
+        env:
+          # Use AUDIT_PAT so the gh package can read private/org repos
+          GITHUB_PAT: ${{ secrets.AUDIT_PAT }}
+          ORG: ${{ env.ORG }}
+        shell: bash
+        run: |
+          MATRIX=$(Rscript "${{ github.workspace }}/scripts/find_eligible_repos.R")
+          echo "matrix=${MATRIX}" >> "${GITHUB_OUTPUT}"
+
+  # ---------------------------------------------------------------------------
+  # Job 2 – audit each eligible repository in parallel
+  # ---------------------------------------------------------------------------
+  audit-repo:
+    needs: find-repos
+    # Skip the entire job when no eligible repositories were found
+    if: needs.find-repos.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.find-repos.outputs.matrix) }}
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 1. Checkout repo-audits so scripts/ and nih_institutes.json are available
+      # -----------------------------------------------------------------------
+      - name: Checkout repo-audits
+        uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 2. Set up R and install required packages
+      # -----------------------------------------------------------------------
+      - name: Set up R
+        uses: r-lib/actions/setup-r@v2
+        with:
+          r-version: release
+
+      - name: Install R packages
+        shell: Rscript {0}
+        run: |
+          options(repos = c(CRAN = "https://p3m.dev/cran/__linux__/noble/latest"))
+          install.packages(c("desc", "jsonlite"))
+
+      # -----------------------------------------------------------------------
+      # 3. Additional eligibility checks (devel branch, DESCRIPTION file)
+      # -----------------------------------------------------------------------
+      - name: Check eligibility for ${{ matrix.repo }}
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+        run: |
+          set -euo pipefail
+          REPO="${{ matrix.repo }}"
+
+          echo "==> Auditing ${ORG}/${REPO} ..."
+
+          # Require devel branch
+          if ! gh api "repos/${ORG}/${REPO}/branches/devel" > /dev/null 2>&1; then
+            echo "::notice::Skipping ${REPO} – no 'devel' branch found."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Require DESCRIPTION on devel
+          if ! gh api "repos/${ORG}/${REPO}/contents/DESCRIPTION?ref=devel" \
+               > /dev/null 2>&1; then
+            echo "::notice::Skipping ${REPO} – no DESCRIPTION file on devel branch."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "skip=false"                  >> "${GITHUB_OUTPUT}"
+          echo "grants=${{ matrix.grants }}" >> "${GITHUB_OUTPUT}"
+
+      # -----------------------------------------------------------------------
+      # 4. Fetch DESCRIPTION and run the R audit script
+      # -----------------------------------------------------------------------
+      - name: Fetch DESCRIPTION and update Authors@R
+        id: update
+        if: steps.check.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          GRANTS: ${{ steps.check.outputs.grants }}
+          NIH_INSTITUTES_JSON: ${{ github.workspace }}/scripts/nih_institutes.json
+          DESCRIPTION_PATH: /tmp/DESCRIPTION
+          OUTPUT_PATH: /tmp/DESCRIPTION_updated
+        run: |
+          set -euo pipefail
+          REPO="${{ matrix.repo }}"
+
+          # Fetch DESCRIPTION from devel
+          gh api "repos/${ORG}/${REPO}/contents/DESCRIPTION?ref=devel" \
+            --jq '.content' | base64 -d > /tmp/DESCRIPTION
+
+          echo "==> Running R audit script ..."
+          Rscript "${{ github.workspace }}/scripts/audit_single_repo.R"
+
+          if [ -f /tmp/DESCRIPTION_updated ]; then
+            echo "changed=true" >> "${GITHUB_OUTPUT}"
+            echo "==> DESCRIPTION needs updating."
+          else
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            echo "==> No changes needed."
+          fi
+
+      # -----------------------------------------------------------------------
+      # 5a. Create branch, commit and open PR (real run)
+      # -----------------------------------------------------------------------
+      - name: Create branch and open PR
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          steps.update.outputs.changed == 'true' &&
+          inputs.dry_run != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          GRANTS: ${{ steps.check.outputs.grants }}
+        run: |
+          set -euo pipefail
+          REPO="${{ matrix.repo }}"
+          BRANCH="funding/add-fnd-authors-r-${{ github.run_id }}"
+
+          # Get the current devel SHA
+          DEVEL_SHA=$(gh api "repos/${ORG}/${REPO}/branches/devel" \
+                       --jq '.commit.sha')
+
+          # Create new branch off devel
+          gh api "repos/${ORG}/${REPO}/git/refs" \
+            --method POST \
+            --field "ref=refs/heads/${BRANCH}" \
+            --field "sha=${DEVEL_SHA}"
+
+          # Get the existing DESCRIPTION file SHA (required for update)
+          FILE_SHA=$(gh api "repos/${ORG}/${REPO}/contents/DESCRIPTION?ref=devel" \
+                      --jq '.sha')
+
+          # Base64-encode the updated content (no line wrapping)
+          CONTENT=$(base64 -w 0 /tmp/DESCRIPTION_updated)
+
+          # Commit the updated DESCRIPTION
+          gh api "repos/${ORG}/${REPO}/contents/DESCRIPTION" \
+            --method PUT \
+            --field "message=Add missing fnd entries to Authors@R in DESCRIPTION" \
+            --field "content=${CONTENT}" \
+            --field "sha=${FILE_SHA}" \
+            --field "branch=${BRANCH}"
+
+          # Build a human-readable grant list for the PR body
+          GRANT_LIST=$(echo "${GRANTS}" | tr ',' '\n' | sed 's/^/- /')
+
+          # Open PR against devel
+          gh pr create \
+            --repo "${ORG}/${REPO}" \
+            --base devel \
+            --head "${BRANCH}" \
+            --title "Add missing funder entries to Authors@R in DESCRIPTION" \
+            --body "$(printf 'This automated PR adds missing \`fnd\` (funder) entries to the \`Authors@R\` field in \`DESCRIPTION\` based on the following grant topics set on this repository:\n\n%s\n\nOpened by the [repo-audits](https://github.com/waldronlab/repo-audits) workflow (run [#${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})).' "${GRANT_LIST}")"
+
+          echo "::notice::PR created in ${ORG}/${REPO} targeting devel (branch: ${BRANCH})."
+
+      # -----------------------------------------------------------------------
+      # 5b. Dry-run summary
+      # -----------------------------------------------------------------------
+      - name: Dry-run summary
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          steps.update.outputs.changed == 'true' &&
+          inputs.dry_run == 'true'
+        run: |
+          echo "::notice::DRY RUN – changes are needed in ${{ matrix.repo }} but no PR was created."
+          echo "==> Preview of updated DESCRIPTION:"
+          cat /tmp/DESCRIPTION_updated
+
+      # -----------------------------------------------------------------------
+      # 5c. Nothing to do
+      # -----------------------------------------------------------------------
+      - name: No changes needed
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          steps.update.outputs.changed == 'false'
+        run: |
+          echo "::notice::${{ matrix.repo }} is already up to date – all fnd entries present."

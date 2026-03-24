@@ -6,9 +6,20 @@ R / Bioconductor packages and ensuring funding information is present in their
 
 ## What it does
 
-The workflow checks a single target repository in the `waldronlab` organisation
-and opens a pull request against its `devel` branch when grant-funder entries
-are missing from `Authors@R` in `DESCRIPTION`.
+Two complementary workflows are available:
+
+* **Audit All Repos** (`audit-all-repos-funding.yml`) – discovers *every*
+  eligible `waldronlab` R repository automatically using
+  [BiocReporting](https://github.com/Bioconductor/BiocReporting) and audits
+  each one in parallel.  Runs on a weekly schedule (Monday 08:00 UTC) and can
+  also be triggered manually with an optional dry-run flag.
+
+* **Audit Single Repo** (`audit-single-repo-funding.yml`) – checks one
+  repository specified at dispatch time; useful for targeted, on-demand audits.
+
+Both workflows open a pull request against the `devel` branch of a target
+repository when grant-funder entries are missing from `Authors@R` in
+`DESCRIPTION`.
 
 ### Eligibility checks (a repo is skipped when …)
 
@@ -54,9 +65,32 @@ Existing `fnd` entries whose `GrantNo.` already matches the topic are left
 untouched.  Entries with a *different* `GrantNo.` are not overwritten; the new
 entry is simply appended alongside them.
 
-## Running the workflow
+## Running the workflows
 
-### Via the GitHub Actions UI
+### Audit All Repos (automated discovery)
+
+The `audit-all-repos-funding.yml` workflow runs automatically every Monday.
+To trigger it manually:
+
+1. Go to **Actions → Audit All Repos Funding** in this repository.
+2. Click **Run workflow**.
+3. Optionally check **`dry_run`** to preview changes without opening PRs.
+
+The workflow uses the following functions from
+[BiocReporting](https://github.com/Bioconductor/BiocReporting) to discover
+eligible repositories:
+
+| BiocReporting function | Purpose |
+|---|---|
+| `account_repositories(org = "waldronlab")` | List all repositories in the organisation |
+| `filter_r_repos(repo_list)` | Keep only repositories that contain R code |
+
+It then applies a regex pattern (`^(u24|r01)[a-z]{2}[0-9]{6,}$`) to each
+repository's topics, following the same approach as
+`BiocReporting::filter_topic_repos()` but using pattern matching so that
+grant numbers do not need to be enumerated in advance.
+
+### Audit Single Repo (on-demand)
 
 1. Go to **Actions → Audit Single Repo Funding** in this repository.
 2. Click **Run workflow**.
@@ -86,10 +120,12 @@ it can create branches, commit, and open pull requests.
 ```
 .github/
   workflows/
-    audit-single-repo-funding.yml   # The main workflow
+    audit-all-repos-funding.yml    # Discovers all eligible repos via BiocReporting and audits each
+    audit-single-repo-funding.yml  # On-demand audit for a single named repository
 scripts/
-  audit_single_repo.R               # R script: parses/updates Authors@R
-  nih_institutes.json               # NIH institute code → agency name map
+  find_eligible_repos.R            # R script: uses BiocReporting to enumerate eligible repos
+  audit_single_repo.R              # R script: parses/updates Authors@R in DESCRIPTION
+  nih_institutes.json              # NIH institute code → agency name map
 README.md
 ```
 
