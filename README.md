@@ -46,7 +46,7 @@ For each unrecognised grant a `person()` entry with role `"fnd"` is **appended**
 to the end of the `Authors@R` vector:
 
 ```r
-person("NHGRI AnVIL Project", role = "fnd",
+person("NHGRI", role = "fnd",
     comment = c(GrantNo. = "U24HG010263"))
 ```
 
