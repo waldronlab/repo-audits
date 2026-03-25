@@ -35,13 +35,7 @@ jobs:
 
     steps:
       # -----------------------------------------------------------------------
-      # 1. Checkout repo-audits (for scripts/ci.yml and PR body template)
-      # -----------------------------------------------------------------------
-      - name: Checkout repo-audits
-        uses: actions/checkout@v4
-
-      # -----------------------------------------------------------------------
-      # 2. List all repositories that still need migration (informational)
+      # 1. List all repositories that still need migration (informational)
       # -----------------------------------------------------------------------
       - name: List un-migrated repositories
         env:
@@ -78,7 +72,7 @@ jobs:
           fi
 
       # -----------------------------------------------------------------------
-      # 3. Check eligibility of the target repository
+      # 2. Check eligibility of the target repository
       # -----------------------------------------------------------------------
       - name: Check eligibility
         id: check
@@ -155,7 +149,7 @@ jobs:
           echo "==> ${REPO} is eligible for migration."
 
       # -----------------------------------------------------------------------
-      # 4. Create branch and open PR (real run)
+      # 3. Create branch and open PR (real run)
       # -----------------------------------------------------------------------
       - name: Create branch and open PR
         if: >
@@ -169,8 +163,12 @@ jobs:
           REPO="${{ inputs.repo }}"
           BRANCH="ci/migrate-pr-check-to-ci-yml-${{ github.run_id }}"
 
-          # ── ci.yml content – read from scripts/ci.yml in this repo ──
-          CI_YML=$(base64 -w 0 "${{ github.workspace }}/scripts/ci.yml")
+          # ── ci.yml content – read from scripts/ci.yml in this repo via API ──
+          # (avoids git-checkout context that would cause gh to operate on the
+          #  checked-out repo-audits branch instead of the designated target branch)
+          CI_YML=$(gh api \
+            "repos/${{ github.repository }}/contents/scripts/ci.yml?ref=${{ github.sha }}" \
+            --jq '.content' | tr -d '\n')
 
           # ── Create a branch off the target branch ──
           BASE_SHA=$(gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" \
@@ -205,7 +203,9 @@ jobs:
 
           # ── Build PR body ──
           PR_BODY_FILE=$(mktemp)
-          cat "${{ github.workspace }}/scripts/migrate-pr-check-pr-body.md" > "${PR_BODY_FILE}"
+          gh api \
+            "repos/${{ github.repository }}/contents/scripts/migrate-pr-check-pr-body.md?ref=${{ github.sha }}" \
+            --jq '.content' | base64 -d > "${PR_BODY_FILE}"
           printf '\nOpened by the [repo-audits](https://github.com/waldronlab/repo-audits) workflow (run [#%s](%s/%s/actions/runs/%s)).\n' \
             "${{ github.run_id }}" \
             "${{ github.server_url }}" \
@@ -225,7 +225,7 @@ jobs:
           echo "::notice::PR created in ${ORG}/${REPO} targeting '${TARGET_BRANCH}' (branch: ${BRANCH})."
 
       # -----------------------------------------------------------------------
-      # 5. Dry-run summary
+      # 4. Dry-run summary
       # -----------------------------------------------------------------------
       - name: Dry-run summary
         if: >
@@ -235,7 +235,7 @@ jobs:
           echo "::notice::DRY RUN – would create migration PR in ${{ inputs.repo }} targeting '${{ inputs.branch }}'."
 
       # -----------------------------------------------------------------------
-      # 6. Nothing to do
+      # 5. Nothing to do
       # -----------------------------------------------------------------------
       - name: No migration needed
         if: steps.check.outputs.skip == 'true'
