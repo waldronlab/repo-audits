@@ -53,7 +53,7 @@ jobs:
 
           echo "==> Searching for repos with pr_check.yml on branch '${TARGET_BRANCH}' …"
           REPOS=$(gh api --paginate \
-            "search/code?q=filename:pr_check.yml+path:.github/workflows+org:${ORG}+ref:refs/heads/${TARGET_BRANCH}" \
+            "search/code?q=filename:pr_check.yml+path:.github/workflows+org:${ORG}" \
             --jq '.items[].repository.name' \
             | sort -u || true)
 
