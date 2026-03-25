@@ -1,8 +1,14 @@
-name: Migrate pr_check.yml to ci.yaml
+name: Migrate pr_check.yml to ci.yml
 
 on:
   workflow_dispatch:
     inputs:
+      repo:
+        description: >
+          Repository name within the waldronlab organisation to migrate
+          (e.g. MultiAssayExperiment)
+        required: true
+        type: string
       branch:
         description: >
           Target branch to search and open PRs against
@@ -29,158 +35,210 @@ jobs:
 
     steps:
       # -----------------------------------------------------------------------
-      # 1. Checkout repo-audits (for context / traceability)
+      # 1. Checkout repo-audits (for scripts/ci.yml and PR body template)
       # -----------------------------------------------------------------------
       - name: Checkout repo-audits
         uses: actions/checkout@v4
 
       # -----------------------------------------------------------------------
-      # 2. Discover repos and create migration PRs
+      # 2. List all repositories that still need migration (informational)
       # -----------------------------------------------------------------------
-      - name: Create PRs to migrate pr_check.yml to ci.yaml
+      - name: List un-migrated repositories
         env:
           GH_TOKEN: ${{ secrets.AUDIT_PAT }}
           TARGET_BRANCH: ${{ inputs.branch }}
-          DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
 
-          # ── ci.yaml content – read from scripts/ci.yaml in this repo ──
-          CI_YAML=$(base64 -w 0 "${{ github.workspace }}/scripts/ci.yaml")
-
-          # ── Find every waldronlab repo that has .github/workflows/pr_check.yml
-          #    on the target branch (ref: qualifier restricts the search) ──
           echo "==> Searching for repos with pr_check.yml on branch '${TARGET_BRANCH}' …"
           REPOS=$(gh api --paginate \
             "search/code?q=filename:pr_check.yml+path:.github/workflows+org:${ORG}+ref:refs/heads/${TARGET_BRANCH}" \
             --jq '.items[].repository.name' \
-            | sort -u)
+            | sort -u || true)
 
           if [ -z "${REPOS}" ]; then
-            echo "::notice::No repositories found with .github/workflows/pr_check.yml on branch '${TARGET_BRANCH}' – nothing to do."
+            echo "::notice::No repositories found with pr_check.yml on branch '${TARGET_BRANCH}'."
             exit 0
           fi
 
-          echo "==> Found repos:"
-          echo "${REPOS}" | sed 's/^/  - /'
-
-          # ── Process each repo ──
+          UNMIGRATED=""
           for REPO in ${REPOS}; do
-            echo ""
-            echo "==> Processing ${ORG}/${REPO} …"
-
-            # Skip archived repos
-            IS_ARCHIVED=$(gh api "repos/${ORG}/${REPO}" --jq '.archived')
-            if [ "${IS_ARCHIVED}" = "true" ]; then
-              echo "::notice::Skipping ${REPO} – it is archived."
-              continue
-            fi
-
-            # Skip forks
-            IS_FORK=$(gh api "repos/${ORG}/${REPO}" --jq '.fork')
-            if [ "${IS_FORK}" = "true" ]; then
-              echo "::notice::Skipping ${REPO} – it is a fork."
-              continue
-            fi
-
-            # Require the target branch to exist
-            if ! gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" > /dev/null 2>&1; then
-              echo "::notice::Skipping ${REPO} – branch '${TARGET_BRANCH}' not found."
-              continue
-            fi
-
-            # Confirm pr_check.yml actually exists on the target branch
-            PR_CHECK_SHA=$(gh api \
-              "repos/${ORG}/${REPO}/contents/.github/workflows/pr_check.yml?ref=${TARGET_BRANCH}" \
-              --jq '.sha' 2>/dev/null || true)
-            if [ -z "${PR_CHECK_SHA}" ]; then
-              echo "::notice::Skipping ${REPO} – pr_check.yml not found on '${TARGET_BRANCH}'."
-              continue
-            fi
-
-            # Skip if ci.yaml or ci.yml already exists on the target branch
-            if gh api \
-              "repos/${ORG}/${REPO}/contents/.github/workflows/ci.yaml?ref=${TARGET_BRANCH}" \
-              > /dev/null 2>&1 || \
-               gh api \
+            if ! gh api \
               "repos/${ORG}/${REPO}/contents/.github/workflows/ci.yml?ref=${TARGET_BRANCH}" \
               > /dev/null 2>&1; then
-              echo "::notice::Skipping ${REPO} – ci.yaml or ci.yml already exists on '${TARGET_BRANCH}'."
-              continue
+              UNMIGRATED="${UNMIGRATED}  - ${REPO}\n"
             fi
-
-            # Skip if a migration PR already exists
-            EXISTING_PR=$(gh pr list \
-              --repo "${ORG}/${REPO}" \
-              --state open \
-              --search "Migrate pr_check.yml to ci.yaml in:title" \
-              --json number \
-              --jq '.[0].number' 2>/dev/null || true)
-            if [ -n "${EXISTING_PR}" ]; then
-              echo "::notice::Skipping ${REPO} – migration PR #${EXISTING_PR} already open."
-              continue
-            fi
-
-            if [ "${DRY_RUN}" = "true" ]; then
-              echo "::notice::DRY RUN – would create migration PR in ${ORG}/${REPO} (base: ${TARGET_BRANCH})."
-              continue
-            fi
-
-            # ── Create a branch off the target branch ──
-            BRANCH="ci/migrate-pr-check-to-ci-yaml-${{ github.run_id }}"
-            BASE_SHA=$(gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" \
-                         --jq '.commit.sha')
-
-            gh api "repos/${ORG}/${REPO}/git/refs" \
-              --method POST \
-              --field "ref=refs/heads/${BRANCH}" \
-              --field "sha=${BASE_SHA}"
-            echo "  Created branch: ${BRANCH} (off ${TARGET_BRANCH})"
-
-            # ── Add ci.yaml ──
-            gh api "repos/${ORG}/${REPO}/contents/.github/workflows/ci.yaml" \
-              --method PUT \
-              --field "message=Add ci.yaml reusable-workflow wrapper" \
-              --field "content=${CI_YAML}" \
-              --field "branch=${BRANCH}"
-            echo "  Added .github/workflows/ci.yaml"
-
-            # ── Re-fetch pr_check.yml SHA from the new branch immediately before
-            #    deleting, to avoid stale-SHA errors if the file was concurrently
-            #    updated on the base branch. ──
-            CURRENT_PR_CHECK_SHA=$(gh api \
-              "repos/${ORG}/${REPO}/contents/.github/workflows/pr_check.yml?ref=${BRANCH}" \
-              --jq '.sha')
-
-            gh api "repos/${ORG}/${REPO}/contents/.github/workflows/pr_check.yml" \
-              --method DELETE \
-              --field "message=Remove pr_check.yml (replaced by ci.yaml)" \
-              --field "sha=${CURRENT_PR_CHECK_SHA}" \
-              --field "branch=${BRANCH}"
-            echo "  Deleted .github/workflows/pr_check.yml"
-
-            # ── Build PR body ──
-            PR_BODY_FILE=$(mktemp)
-            cat "${{ github.workspace }}/scripts/migrate-pr-check-pr-body.md" > "${PR_BODY_FILE}"
-            printf '\nOpened by the [repo-audits](https://github.com/waldronlab/repo-audits) workflow (run [#%s](%s/%s/actions/runs/%s)).\n' \
-              "${{ github.run_id }}" \
-              "${{ github.server_url }}" \
-              "${{ github.repository }}" \
-              "${{ github.run_id }}" >> "${PR_BODY_FILE}"
-
-            # ── Open PR ──
-            gh pr create \
-              --repo "${ORG}/${REPO}" \
-              --base "${TARGET_BRANCH}" \
-              --head "${BRANCH}" \
-              --title "Migrate pr_check.yml to ci.yaml" \
-              --body-file "${PR_BODY_FILE}"
-
-            rm -f "${PR_BODY_FILE}"
-
-            echo "::notice::PR created in ${ORG}/${REPO} targeting '${TARGET_BRANCH}' (branch: ${BRANCH})."
           done
 
-          echo ""
-          echo "==> Migration complete."
+          if [ -z "${UNMIGRATED}" ]; then
+            echo "::notice::All repositories with pr_check.yml on '${TARGET_BRANCH}' already have ci.yml – nothing left to migrate."
+          else
+            echo "==> Repositories still needing migration on branch '${TARGET_BRANCH}':"
+            printf "%b" "${UNMIGRATED}"
+          fi
+
+      # -----------------------------------------------------------------------
+      # 3. Check eligibility of the target repository
+      # -----------------------------------------------------------------------
+      - name: Check eligibility
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+
+          echo "==> Checking ${ORG}/${REPO} …"
+
+          # --- Fetch repo metadata -------------------------------------------
+          if ! REPO_JSON=$(gh api "repos/${ORG}/${REPO}" 2>&1); then
+            echo "::error::Repository ${ORG}/${REPO} not found or not accessible."
+            exit 1
+          fi
+
+          IS_FORK=$(echo "${REPO_JSON}"     | jq -r '.fork')
+          IS_ARCHIVED=$(echo "${REPO_JSON}" | jq -r '.archived')
+
+          if [ "${IS_FORK}" = "true" ]; then
+            echo "::notice::Skipping ${REPO} – it is a fork."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [ "${IS_ARCHIVED}" = "true" ]; then
+            echo "::notice::Skipping ${REPO} – it is archived."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Require the target branch to exist
+          if ! gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" > /dev/null 2>&1; then
+            echo "::notice::Skipping ${REPO} – branch '${TARGET_BRANCH}' not found."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Confirm pr_check.yml exists on the target branch
+          PR_CHECK_SHA=$(gh api \
+            "repos/${ORG}/${REPO}/contents/.github/workflows/pr_check.yml?ref=${TARGET_BRANCH}" \
+            --jq '.sha' 2>/dev/null || true)
+          if [ -z "${PR_CHECK_SHA}" ]; then
+            echo "::notice::Skipping ${REPO} – pr_check.yml not found on '${TARGET_BRANCH}'."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Skip if ci.yml already exists on the target branch
+          if gh api \
+            "repos/${ORG}/${REPO}/contents/.github/workflows/ci.yml?ref=${TARGET_BRANCH}" \
+            > /dev/null 2>&1; then
+            echo "::notice::Skipping ${REPO} – ci.yml already exists on '${TARGET_BRANCH}'."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Skip if a migration PR already exists
+          EXISTING_PR=$(gh pr list \
+            --repo "${ORG}/${REPO}" \
+            --state open \
+            --search "Migrate pr_check.yml to ci.yml in:title" \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "${EXISTING_PR}" ]; then
+            echo "::notice::Skipping ${REPO} – migration PR #${EXISTING_PR} already open."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "skip=false" >> "${GITHUB_OUTPUT}"
+          echo "==> ${REPO} is eligible for migration."
+
+      # -----------------------------------------------------------------------
+      # 4. Create branch and open PR (real run)
+      # -----------------------------------------------------------------------
+      - name: Create branch and open PR
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          inputs.dry_run == false
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+          BRANCH="ci/migrate-pr-check-to-ci-yml-${{ github.run_id }}"
+
+          # ── ci.yml content – read from scripts/ci.yml in this repo ──
+          CI_YML=$(base64 -w 0 "${{ github.workspace }}/scripts/ci.yml")
+
+          # ── Create a branch off the target branch ──
+          BASE_SHA=$(gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" \
+                       --jq '.commit.sha')
+
+          gh api "repos/${ORG}/${REPO}/git/refs" \
+            --method POST \
+            --field "ref=refs/heads/${BRANCH}" \
+            --field "sha=${BASE_SHA}"
+          echo "  Created branch: ${BRANCH} (off ${TARGET_BRANCH})"
+
+          # ── Add ci.yml ──
+          gh api "repos/${ORG}/${REPO}/contents/.github/workflows/ci.yml" \
+            --method PUT \
+            --field "message=Add ci.yml reusable-workflow wrapper" \
+            --field "content=${CI_YML}" \
+            --field "branch=${BRANCH}"
+          echo "  Added .github/workflows/ci.yml"
+
+          # ── Re-fetch pr_check.yml SHA from the new branch immediately before
+          #    deleting, to avoid stale-SHA errors. ──
+          PR_CHECK_SHA=$(gh api \
+            "repos/${ORG}/${REPO}/contents/.github/workflows/pr_check.yml?ref=${BRANCH}" \
+            --jq '.sha')
+
+          gh api "repos/${ORG}/${REPO}/contents/.github/workflows/pr_check.yml" \
+            --method DELETE \
+            --field "message=Remove pr_check.yml (replaced by ci.yml)" \
+            --field "sha=${PR_CHECK_SHA}" \
+            --field "branch=${BRANCH}"
+          echo "  Deleted .github/workflows/pr_check.yml"
+
+          # ── Build PR body ──
+          PR_BODY_FILE=$(mktemp)
+          cat "${{ github.workspace }}/scripts/migrate-pr-check-pr-body.md" > "${PR_BODY_FILE}"
+          printf '\nOpened by the [repo-audits](https://github.com/waldronlab/repo-audits) workflow (run [#%s](%s/%s/actions/runs/%s)).\n' \
+            "${{ github.run_id }}" \
+            "${{ github.server_url }}" \
+            "${{ github.repository }}" \
+            "${{ github.run_id }}" >> "${PR_BODY_FILE}"
+
+          # ── Open PR ──
+          gh pr create \
+            --repo "${ORG}/${REPO}" \
+            --base "${TARGET_BRANCH}" \
+            --head "${BRANCH}" \
+            --title "Migrate pr_check.yml to ci.yml" \
+            --body-file "${PR_BODY_FILE}"
+
+          rm -f "${PR_BODY_FILE}"
+
+          echo "::notice::PR created in ${ORG}/${REPO} targeting '${TARGET_BRANCH}' (branch: ${BRANCH})."
+
+      # -----------------------------------------------------------------------
+      # 5. Dry-run summary
+      # -----------------------------------------------------------------------
+      - name: Dry-run summary
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          inputs.dry_run == true
+        run: |
+          echo "::notice::DRY RUN – would create migration PR in ${{ inputs.repo }} targeting '${{ inputs.branch }}'."
+
+      # -----------------------------------------------------------------------
+      # 6. Nothing to do
+      # -----------------------------------------------------------------------
+      - name: No migration needed
+        if: steps.check.outputs.skip == 'true'
+        run: |
+          echo "::notice::${{ inputs.repo }} does not need migration – skipped."
 
