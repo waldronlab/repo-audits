@@ -35,6 +35,13 @@ jobs:
 
     steps:
       # -----------------------------------------------------------------------
+      # 0. Checkout repo-audits@devel so scripts/ are available locally
+      # -----------------------------------------------------------------------
+      - uses: actions/checkout@v4
+        with:
+          ref: devel
+
+      # -----------------------------------------------------------------------
       # 1. List all repositories that still need migration (informational)
       # -----------------------------------------------------------------------
       - name: List un-migrated repositories
@@ -163,12 +170,8 @@ jobs:
           REPO="${{ inputs.repo }}"
           BRANCH="ci/migrate-pr-check-to-ci-yml-${{ github.run_id }}"
 
-          # ── ci.yml content – read from scripts/ci.yml in this repo via API ──
-          # (avoids git-checkout context that would cause gh to operate on the
-          #  checked-out repo-audits branch instead of the designated target branch)
-          CI_YML=$(gh api \
-            "repos/${{ github.repository }}/contents/scripts/ci.yml?ref=${{ github.sha }}" \
-            --jq '.content' | tr -d '\n')
+          # ── ci.yml content – read locally from this repo ──
+          CI_YML=$(base64 -w0 scripts/ci.yml)
 
           # ── Create a branch off the target branch ──
           BASE_SHA=$(gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" \
@@ -203,9 +206,7 @@ jobs:
 
           # ── Build PR body ──
           PR_BODY_FILE=$(mktemp)
-          gh api \
-            "repos/${{ github.repository }}/contents/scripts/migrate-pr-check-pr-body.md?ref=${{ github.sha }}" \
-            --jq '.content' | base64 -d > "${PR_BODY_FILE}"
+          cp scripts/migrate-pr-check-pr-body.md "${PR_BODY_FILE}"
           printf '\nOpened by the [repo-audits](https://github.com/waldronlab/repo-audits) workflow (run [#%s](%s/%s/actions/runs/%s)).\n' \
             "${{ github.run_id }}" \
             "${{ github.server_url }}" \
