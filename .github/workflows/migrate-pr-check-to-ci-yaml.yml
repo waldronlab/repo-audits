@@ -3,6 +3,13 @@ name: Migrate pr_check.yml to ci.yaml
 on:
   workflow_dispatch:
     inputs:
+      branch:
+        description: >
+          Target branch to search and open PRs against
+          (e.g. devel, RELEASE_3_22)
+        required: false
+        type: string
+        default: devel
       dry_run:
         description: >
           Dry run – perform all checks and show what would change,
@@ -33,6 +40,7 @@ jobs:
       - name: Create PRs to migrate pr_check.yml to ci.yaml
         env:
           GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          TARGET_BRANCH: ${{ inputs.branch }}
           DRY_RUN: ${{ inputs.dry_run }}
         run: |
           set -euo pipefail
@@ -40,15 +48,16 @@ jobs:
           # ── ci.yaml content – read from scripts/ci.yaml in this repo ──
           CI_YAML=$(base64 -w 0 "${{ github.workspace }}/scripts/ci.yaml")
 
-          # ── Find every waldronlab repo that has .github/workflows/pr_check.yml ──
-          echo "==> Searching for repos with pr_check.yml …"
+          # ── Find every waldronlab repo that has .github/workflows/pr_check.yml
+          #    on the target branch (ref: qualifier restricts the search) ──
+          echo "==> Searching for repos with pr_check.yml on branch '${TARGET_BRANCH}' …"
           REPOS=$(gh api --paginate \
-            "search/code?q=filename:pr_check.yml+path:.github/workflows+org:${ORG}" \
+            "search/code?q=filename:pr_check.yml+path:.github/workflows+org:${ORG}+ref:refs/heads/${TARGET_BRANCH}" \
             --jq '.items[].repository.name' \
             | sort -u)
 
           if [ -z "${REPOS}" ]; then
-            echo "::notice::No repositories found with .github/workflows/pr_check.yml – nothing to do."
+            echo "::notice::No repositories found with .github/workflows/pr_check.yml on branch '${TARGET_BRANCH}' – nothing to do."
             exit 0
           fi
 
@@ -74,26 +83,29 @@ jobs:
               continue
             fi
 
-            # Require a devel branch
-            if ! gh api "repos/${ORG}/${REPO}/branches/devel" > /dev/null 2>&1; then
-              echo "::notice::Skipping ${REPO} – no 'devel' branch found."
+            # Require the target branch to exist
+            if ! gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" > /dev/null 2>&1; then
+              echo "::notice::Skipping ${REPO} – branch '${TARGET_BRANCH}' not found."
               continue
             fi
 
-            # Confirm pr_check.yml actually exists on devel
+            # Confirm pr_check.yml actually exists on the target branch
             PR_CHECK_SHA=$(gh api \
-              "repos/${ORG}/${REPO}/contents/.github/workflows/pr_check.yml?ref=devel" \
+              "repos/${ORG}/${REPO}/contents/.github/workflows/pr_check.yml?ref=${TARGET_BRANCH}" \
               --jq '.sha' 2>/dev/null || true)
             if [ -z "${PR_CHECK_SHA}" ]; then
-              echo "::notice::Skipping ${REPO} – pr_check.yml not found on devel."
+              echo "::notice::Skipping ${REPO} – pr_check.yml not found on '${TARGET_BRANCH}'."
               continue
             fi
 
-            # Skip if ci.yaml already exists on devel
+            # Skip if ci.yaml or ci.yml already exists on the target branch
             if gh api \
-              "repos/${ORG}/${REPO}/contents/.github/workflows/ci.yaml?ref=devel" \
+              "repos/${ORG}/${REPO}/contents/.github/workflows/ci.yaml?ref=${TARGET_BRANCH}" \
+              > /dev/null 2>&1 || \
+               gh api \
+              "repos/${ORG}/${REPO}/contents/.github/workflows/ci.yml?ref=${TARGET_BRANCH}" \
               > /dev/null 2>&1; then
-              echo "::notice::Skipping ${REPO} – ci.yaml already exists on devel."
+              echo "::notice::Skipping ${REPO} – ci.yaml or ci.yml already exists on '${TARGET_BRANCH}'."
               continue
             fi
 
@@ -110,20 +122,20 @@ jobs:
             fi
 
             if [ "${DRY_RUN}" = "true" ]; then
-              echo "::notice::DRY RUN – would create migration PR in ${ORG}/${REPO}."
+              echo "::notice::DRY RUN – would create migration PR in ${ORG}/${REPO} (base: ${TARGET_BRANCH})."
               continue
             fi
 
-            # ── Create a branch off devel ──
+            # ── Create a branch off the target branch ──
             BRANCH="ci/migrate-pr-check-to-ci-yaml-${{ github.run_id }}"
-            DEVEL_SHA=$(gh api "repos/${ORG}/${REPO}/branches/devel" \
-                          --jq '.commit.sha')
+            BASE_SHA=$(gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" \
+                         --jq '.commit.sha')
 
             gh api "repos/${ORG}/${REPO}/git/refs" \
               --method POST \
               --field "ref=refs/heads/${BRANCH}" \
-              --field "sha=${DEVEL_SHA}"
-            echo "  Created branch: ${BRANCH}"
+              --field "sha=${BASE_SHA}"
+            echo "  Created branch: ${BRANCH} (off ${TARGET_BRANCH})"
 
             # ── Add ci.yaml ──
             gh api "repos/${ORG}/${REPO}/contents/.github/workflows/ci.yaml" \
@@ -133,11 +145,17 @@ jobs:
               --field "branch=${BRANCH}"
             echo "  Added .github/workflows/ci.yaml"
 
-            # ── Delete pr_check.yml ──
+            # ── Re-fetch pr_check.yml SHA from the new branch immediately before
+            #    deleting, to avoid stale-SHA errors if the file was concurrently
+            #    updated on the base branch. ──
+            CURRENT_PR_CHECK_SHA=$(gh api \
+              "repos/${ORG}/${REPO}/contents/.github/workflows/pr_check.yml?ref=${BRANCH}" \
+              --jq '.sha')
+
             gh api "repos/${ORG}/${REPO}/contents/.github/workflows/pr_check.yml" \
               --method DELETE \
               --field "message=Remove pr_check.yml (replaced by ci.yaml)" \
-              --field "sha=${PR_CHECK_SHA}" \
+              --field "sha=${CURRENT_PR_CHECK_SHA}" \
               --field "branch=${BRANCH}"
             echo "  Deleted .github/workflows/pr_check.yml"
 
@@ -153,15 +171,16 @@ jobs:
             # ── Open PR ──
             gh pr create \
               --repo "${ORG}/${REPO}" \
-              --base devel \
+              --base "${TARGET_BRANCH}" \
               --head "${BRANCH}" \
               --title "Migrate pr_check.yml to ci.yaml" \
               --body-file "${PR_BODY_FILE}"
 
             rm -f "${PR_BODY_FILE}"
 
-            echo "::notice::PR created in ${ORG}/${REPO} (branch: ${BRANCH})."
+            echo "::notice::PR created in ${ORG}/${REPO} targeting '${TARGET_BRANCH}' (branch: ${BRANCH})."
           done
 
           echo ""
           echo "==> Migration complete."
+
