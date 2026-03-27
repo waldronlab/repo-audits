@@ -1,0 +1,198 @@
+name: Add ci.yml to new package
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: >
+          Repository name within the waldronlab organisation to add ci.yml to
+          (e.g. MultiAssayExperiment)
+        required: true
+        type: string
+      branch:
+        description: >
+          Target branch to search and open PRs against
+          (e.g. devel, RELEASE_3_22)
+        required: false
+        type: string
+        default: devel
+      workflow_version:
+        description: >
+          Version tag of the reusable workflow to reference in ci.yml
+          (e.g. devel, v1). This becomes the @<version> suffix in the
+          `uses:` line of the generated ci.yml.
+        required: false
+        type: string
+        default: devel
+      dry_run:
+        description: >
+          Dry run – perform all checks and show what would change,
+          but do NOT push branches, commits, or open PRs
+        required: false
+        type: boolean
+        default: false
+
+env:
+  ORG: waldronlab
+
+jobs:
+  add-ci:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 0. Checkout repo-audits@devel so scripts/ are available locally
+      # -----------------------------------------------------------------------
+      - uses: actions/checkout@v4
+        with:
+          ref: devel
+
+      # -----------------------------------------------------------------------
+      # 1. Check eligibility of the target repository
+      # -----------------------------------------------------------------------
+      - name: Check eligibility
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+
+          echo "==> Checking ${ORG}/${REPO} …"
+
+          # --- Fetch repo metadata -------------------------------------------
+          if ! REPO_JSON=$(gh api "repos/${ORG}/${REPO}" 2>&1); then
+            echo "::error::Repository ${ORG}/${REPO} not found or not accessible."
+            exit 1
+          fi
+
+          IS_FORK=$(echo "${REPO_JSON}"     | jq -r '.fork')
+          IS_ARCHIVED=$(echo "${REPO_JSON}" | jq -r '.archived')
+
+          if [ "${IS_FORK}" = "true" ]; then
+            echo "::notice::Skipping ${REPO} – it is a fork."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [ "${IS_ARCHIVED}" = "true" ]; then
+            echo "::notice::Skipping ${REPO} – it is archived."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Require the target branch to exist
+          if ! gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" > /dev/null 2>&1; then
+            echo "::notice::Skipping ${REPO} – branch '${TARGET_BRANCH}' not found."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Skip if ci.yml already exists on the target branch
+          if gh api \
+            "repos/${ORG}/${REPO}/contents/.github/workflows/ci.yml?ref=${TARGET_BRANCH}" \
+            > /dev/null 2>&1; then
+            echo "::notice::Skipping ${REPO} – ci.yml already exists on '${TARGET_BRANCH}'."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Skip if an add-ci PR already exists
+          EXISTING_PR=$(gh pr list \
+            --repo "${ORG}/${REPO}" \
+            --state open \
+            --search "Add ci.yml in:title" \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "${EXISTING_PR}" ]; then
+            echo "::notice::Skipping ${REPO} – add-ci PR #${EXISTING_PR} already open."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "skip=false" >> "${GITHUB_OUTPUT}"
+          echo "==> ${REPO} is eligible – ci.yml will be added."
+
+      # -----------------------------------------------------------------------
+      # 2. Create branch and open PR (real run)
+      # -----------------------------------------------------------------------
+      - name: Create branch and open PR
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          inputs.dry_run == false
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+          WORKFLOW_VERSION: ${{ inputs.workflow_version }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+          BRANCH="ci/add-ci-yml-${{ github.run_id }}"
+
+          # ── Generate ci.yml with the requested workflow version ──
+          if ! grep -q '@devel' scripts/ci.yml; then
+            echo "::error::scripts/ci.yml does not contain the expected '@devel' version reference."
+            exit 1
+          fi
+          CI_YML_CONTENT=$(sed "s|@devel|@${WORKFLOW_VERSION}|g" scripts/ci.yml)
+          CI_YML=$(printf '%s' "${CI_YML_CONTENT}" | base64 -w0)
+
+          # ── Create a branch off the target branch ──
+          BASE_SHA=$(gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" \
+                       --jq '.commit.sha')
+
+          gh api "repos/${ORG}/${REPO}/git/refs" \
+            --method POST \
+            --field "ref=refs/heads/${BRANCH}" \
+            --field "sha=${BASE_SHA}"
+          echo "  Created branch: ${BRANCH} (off ${TARGET_BRANCH})"
+
+          # ── Add ci.yml ──
+          gh api "repos/${ORG}/${REPO}/contents/.github/workflows/ci.yml" \
+            --method PUT \
+            --field "message=Add ci.yml reusable-workflow wrapper" \
+            --field "content=${CI_YML}" \
+            --field "branch=${BRANCH}"
+          echo "  Added .github/workflows/ci.yml"
+
+          # ── Build PR body ──
+          PR_BODY_FILE=$(mktemp)
+          cp scripts/add-ci-pr-body.md "${PR_BODY_FILE}"
+          printf '\nOpened by the [repo-audits](https://github.com/waldronlab/repo-audits) workflow (run [#%s](%s/%s/actions/runs/%s)).\n' \
+            "${{ github.run_id }}" \
+            "${{ github.server_url }}" \
+            "${{ github.repository }}" \
+            "${{ github.run_id }}" >> "${PR_BODY_FILE}"
+
+          # ── Open PR ──
+          gh pr create \
+            --repo "${ORG}/${REPO}" \
+            --base "${TARGET_BRANCH}" \
+            --head "${BRANCH}" \
+            --title "Add ci.yml reusable-workflow wrapper" \
+            --body-file "${PR_BODY_FILE}"
+
+          rm -f "${PR_BODY_FILE}"
+
+          echo "::notice::PR created in ${ORG}/${REPO} targeting '${TARGET_BRANCH}' (branch: ${BRANCH}, version: ${WORKFLOW_VERSION})."
+
+      # -----------------------------------------------------------------------
+      # 3. Dry-run summary
+      # -----------------------------------------------------------------------
+      - name: Dry-run summary
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          inputs.dry_run == true
+        run: |
+          echo "::notice::DRY RUN – would create add-ci PR in ${{ inputs.repo }} targeting '${{ inputs.branch }}' with workflow version '${{ inputs.workflow_version }}'."
+
+      # -----------------------------------------------------------------------
+      # 4. Nothing to do
+      # -----------------------------------------------------------------------
+      - name: No action needed
+        if: steps.check.outputs.skip == 'true'
+        run: |
+          echo "::notice::${{ inputs.repo }} does not need ci.yml added – skipped."
