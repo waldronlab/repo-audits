@@ -133,11 +133,11 @@ jobs:
           BRANCH="ci/add-ci-yml-${{ github.run_id }}"
 
           # ── Generate ci.yml with the requested workflow version ──
-          if ! grep -q '@devel' scripts/ci.yml; then
-            echo "::error::scripts/ci.yml does not contain the expected '@devel' version reference."
+          if ! grep -qE '\.yml@[A-Za-z0-9._-]+' scripts/ci.yml; then
+            echo "::error::scripts/ci.yml does not contain a version reference (e.g. bioc-pr-cmdcheck-pkgdown.yml@devel)."
             exit 1
           fi
-          CI_YML_CONTENT=$(sed "s|@devel|@${WORKFLOW_VERSION}|g" scripts/ci.yml)
+          CI_YML_CONTENT=$(sed -E "s|(\.yml@)[A-Za-z0-9._-]+|\1${WORKFLOW_VERSION}|g" scripts/ci.yml)
           CI_YML=$(printf '%s' "${CI_YML_CONTENT}" | base64 -w0)
 
           # ── Create a branch off the target branch ──
