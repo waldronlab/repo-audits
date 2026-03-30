@@ -186,30 +186,29 @@ jobs:
           WITH_PARAMS="${WITH_PARAMS}      dockerfile_path: ${DOCKERFILE_PATH}"
 
           # ── Generate ci.yml content ──
-          CI_YML_CONTENT=$(printf '%s' \
-"name: PR CMD check & build site
-
-on:
-  pull_request:
-  push:
-    paths:
-      - 'DESCRIPTION'
-      - '**.yml'
-    branches:
-      - devel
-      - 'RELEASE_*'
-
-jobs:
-  ci:
-    uses: waldronlab/.github/.github/workflows/bioc-pr-cmdcheck-pkgdown.yml@${WORKFLOW_VERSION}
-    with:
-$(printf '%b' "${WITH_PARAMS}")
-    secrets: inherit
-    permissions:
-      contents: write
-      pages: write
-      id-token: write
-")
+          CI_YML_CONTENT=$(printf '%s\n' \
+            'name: PR CMD check & build site' \
+            '' \
+            'on:' \
+            '  pull_request:' \
+            '  push:' \
+            '    paths:' \
+            "      - 'DESCRIPTION'" \
+            "      - '**.yml'" \
+            '    branches:' \
+            '      - devel' \
+            "      - 'RELEASE_*'" \
+            '' \
+            'jobs:' \
+            '  ci:' \
+            "    uses: waldronlab/.github/.github/workflows/bioc-pr-cmdcheck-pkgdown.yml@${WORKFLOW_VERSION}" \
+            '    with:' \
+            "$(printf '%b' "${WITH_PARAMS}")" \
+            '    secrets: inherit' \
+            '    permissions:' \
+            '      contents: write' \
+            '      pages: write' \
+            '      id-token: write')
           CI_YML=$(printf '%s' "${CI_YML_CONTENT}" | base64 -w0)
 
           # ── Create a branch off the target branch ──
