@@ -24,6 +24,37 @@ on:
         required: false
         type: string
         default: devel
+      enable_pkgdown:
+        description: >
+          If true, build and deploy pkgdown when on a RELEASE_* branch push.
+          Passed as `enable_pkgdown:` in the generated ci.yml with: block.
+        required: false
+        type: boolean
+        default: true
+      enable_docker:
+        description: >
+          If true, build and push a Docker image when a Dockerfile exists and
+          on a devel push. Passed as `enable_docker:` in the generated ci.yml
+          with: block.
+        required: false
+        type: boolean
+        default: true
+      dockerfile_path:
+        description: >
+          Path to the Dockerfile to build (relative to the repository root).
+          Passed as `dockerfile_path:` in the generated ci.yml with: block.
+        required: false
+        type: string
+        default: inst/docker/pkg/Dockerfile
+      cran:
+        description: >
+          CRAN-like repository URL to use for package installation. Leave
+          blank to use the reusable workflow default
+          (https://p3m.dev/cran/__linux__/noble/latest).
+          If non-empty, passed as `cran:` in the generated ci.yml with: block.
+        required: false
+        type: string
+        default: ''
       dry_run:
         description: >
           Dry run – perform all checks and show what would change,
@@ -127,17 +158,58 @@ jobs:
           GH_TOKEN: ${{ secrets.AUDIT_PAT }}
           TARGET_BRANCH: ${{ inputs.branch }}
           WORKFLOW_VERSION: ${{ inputs.workflow_version }}
+          ENABLE_PKGDOWN: ${{ inputs.enable_pkgdown }}
+          ENABLE_DOCKER: ${{ inputs.enable_docker }}
+          DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
+          CRAN: ${{ inputs.cran }}
         run: |
           set -euo pipefail
           REPO="${{ inputs.repo }}"
           BRANCH="ci/add-ci-yml-${{ github.run_id }}"
 
-          # ── Generate ci.yml with the requested workflow version ──
-          if ! grep -qE '\.yml@[A-Za-z0-9._-]+' scripts/ci.yml; then
-            echo "::error::scripts/ci.yml does not contain a version reference (e.g. bioc-pr-cmdcheck-pkgdown.yml@devel)."
-            exit 1
+          # ── Validate string inputs won't break YAML ──
+          for VAR in DOCKERFILE_PATH CRAN; do
+            VAL="${!VAR}"
+            if [[ "${VAL}" == *$'\n'* || "${VAL}" == *$'\r'* ]]; then
+              echo "::error::Input '${VAR}' must not contain newline characters."
+              exit 1
+            fi
+          done
+
+          # ── Build the with: block; cran is optional ──
+          WITH_PARAMS=""
+          if [ -n "${CRAN}" ]; then
+            WITH_PARAMS="${WITH_PARAMS}      cran: ${CRAN}\n"
           fi
-          CI_YML_CONTENT=$(sed -E "s|(\.yml@)[A-Za-z0-9._-]+|\1${WORKFLOW_VERSION}|g" scripts/ci.yml)
+          WITH_PARAMS="${WITH_PARAMS}      enable_pkgdown: ${ENABLE_PKGDOWN}\n"
+          WITH_PARAMS="${WITH_PARAMS}      enable_docker: ${ENABLE_DOCKER}\n"
+          WITH_PARAMS="${WITH_PARAMS}      dockerfile_path: ${DOCKERFILE_PATH}"
+
+          # ── Generate ci.yml content ──
+          CI_YML_CONTENT=$(printf '%s' \
+"name: PR CMD check & build site
+
+on:
+  pull_request:
+  push:
+    paths:
+      - 'DESCRIPTION'
+      - '**.yml'
+    branches:
+      - devel
+      - 'RELEASE_*'
+
+jobs:
+  ci:
+    uses: waldronlab/.github/.github/workflows/bioc-pr-cmdcheck-pkgdown.yml@${WORKFLOW_VERSION}
+    with:
+$(printf '%b' "${WITH_PARAMS}")
+    secrets: inherit
+    permissions:
+      contents: write
+      pages: write
+      id-token: write
+")
           CI_YML=$(printf '%s' "${CI_YML_CONTENT}" | base64 -w0)
 
           # ── Create a branch off the target branch ──
@@ -177,7 +249,7 @@ jobs:
 
           rm -f "${PR_BODY_FILE}"
 
-          echo "::notice::PR created in ${ORG}/${REPO} targeting '${TARGET_BRANCH}' (branch: ${BRANCH}, version: ${WORKFLOW_VERSION})."
+          echo "::notice::PR created in ${ORG}/${REPO} targeting '${TARGET_BRANCH}' (branch: ${BRANCH}, version: ${WORKFLOW_VERSION}, enable_pkgdown: ${ENABLE_PKGDOWN}, enable_docker: ${ENABLE_DOCKER}, dockerfile_path: ${DOCKERFILE_PATH})."
 
       # -----------------------------------------------------------------------
       # 3. Dry-run summary
@@ -186,8 +258,15 @@ jobs:
         if: >
           steps.check.outputs.skip == 'false' &&
           inputs.dry_run == true
+        env:
+          CRAN_MSG: ${{ inputs.cran != '' && format(', cran={0}', inputs.cran) || '' }}
         run: |
-          echo "::notice::DRY RUN – would create add-ci PR in ${{ inputs.repo }} targeting '${{ inputs.branch }}' with workflow version '${{ inputs.workflow_version }}'."
+          echo "::notice::DRY RUN – would create add-ci PR in \
+          ${{ inputs.repo }} targeting '${{ inputs.branch }}' \
+          with workflow version '${{ inputs.workflow_version }}', \
+          enable_pkgdown=${{ inputs.enable_pkgdown }}, \
+          enable_docker=${{ inputs.enable_docker }}, \
+          dockerfile_path='${{ inputs.dockerfile_path }}'${CRAN_MSG}."
 
       # -----------------------------------------------------------------------
       # 4. Nothing to do

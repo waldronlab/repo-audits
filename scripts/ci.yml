@@ -13,6 +13,10 @@ on:
 jobs:
   ci:
     uses: waldronlab/.github/.github/workflows/bioc-pr-cmdcheck-pkgdown.yml@devel
+    with:
+      enable_pkgdown: true
+      enable_docker: true
+      dockerfile_path: inst/docker/pkg/Dockerfile
     secrets: inherit
     permissions:
       contents: write
