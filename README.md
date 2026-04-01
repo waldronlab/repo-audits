@@ -177,9 +177,13 @@ All missing files are bundled into a single PR against the target branch.
 ### 4. Security Code Review (`security-code-review.yml`)
 
 Clones a single target repository, sends its R and native (C/C++/Fortran) source
-files to an LLM for security analysis using
+files to the Gemini LLM for security analysis using
 [`scripts/instructions.md`](scripts/instructions.md) as the system prompt, and
 opens a GitHub issue in the target repository with the findings.
+
+The review is performed by [`scripts/bulk_security_review.sh`](scripts/bulk_security_review.sh),
+a Bash script that can also be run locally or in parallel across all Bioconductor
+packages (see the script's header for usage instructions).
 
 #### What the review covers
 
@@ -236,18 +240,18 @@ character limit; any remainder is noted in the issue.
    - **`repo`** *(required)* – repository name within `waldronlab`,
      e.g. `MultiAssayExperiment`.
    - **`branch`** *(optional, default `devel`)* – branch to clone and review.
-   - **`model`** *(optional, default `gpt-4o`)* – LLM model to use,
-     e.g. `gpt-4o`, `gpt-4o-mini`, `o1`, `o3-mini`.
+   - **`model`** *(optional, default `gemini-2.5-pro-preview-03-25`)* – Gemini model to use,
+     e.g. `gemini-2.5-pro-preview-03-25`, `gemini-2.0-flash`.
    - **`dry_run`** *(optional, default `false`)* – when `true`, the workflow
      performs the full review and prints the output to the log, but does
      **not** open a GitHub issue.
 
 #### Required additional secret
 
-The `Security Code Review` workflow requires **`OPENAI_API_KEY`** in addition
-to `AUDIT_PAT`.  Any OpenAI-compatible provider can be used; set the optional
-**`OPENAI_API_BASE`** secret or environment variable to point to an alternative
-endpoint (e.g. Azure OpenAI, a self-hosted model, or GitHub Models).
+The `Security Code Review` workflow requires **`GEMINI_API_KEY`** in addition
+to `AUDIT_PAT`.  Obtain a key from [Google AI Studio](https://aistudio.google.com/).
+The model used is controlled by the `model` workflow input; any model name
+supported by the Gemini `generateContent` API can be used.
 
 ---
 
@@ -258,7 +262,7 @@ All workflows use a secret named **`AUDIT_PAT`** – a GitHub
 (classic) with at least the **`repo`** scope, stored in the `waldronlab/repo-audits`
 repository secrets (or organisation secrets).
 
-The `Security Code Review` workflow additionally requires **`OPENAI_API_KEY`**.
+The `Security Code Review` workflow additionally requires **`GEMINI_API_KEY`**.
 
 The token must have write access to the target repositories in `waldronlab` so
 it can create branches, commit, and open pull requests or issues.
@@ -286,7 +290,7 @@ scripts/
   nih_institutes.json               # NIH institute code → agency name map
   SECURITY.md                       # SECURITY.md template copied to target repos
   security-audit-pr-body.md         # PR body template for the security audit
-  security_review.py                # Python script: collects source files, calls LLM
+  bulk_security_review.sh           # Bash script: clones repos, calls Gemini API, builds summary
 README.md
 ```
 
