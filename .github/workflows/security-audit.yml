@@ -1,0 +1,253 @@
+name: Security Audit
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: >
+          Repository name within the waldronlab organisation to audit
+          (e.g. MultiAssayExperiment)
+        required: true
+        type: string
+      branch:
+        description: >
+          Target branch to open PRs against
+          (e.g. devel, RELEASE_3_22)
+        required: false
+        type: string
+        default: devel
+      dry_run:
+        description: >
+          Dry run – perform all checks and show what would change,
+          but do NOT push branches, commits, or open PRs
+        required: false
+        type: boolean
+        default: false
+
+env:
+  ORG: waldronlab
+
+jobs:
+  security-audit:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 0. Checkout repo-audits so scripts/ are available locally
+      # -----------------------------------------------------------------------
+      - uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 1. Check eligibility of the target repository
+      # -----------------------------------------------------------------------
+      - name: Check eligibility
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+
+          echo "==> Checking ${ORG}/${REPO} …"
+
+          # --- Fetch repo metadata -------------------------------------------
+          if ! REPO_JSON=$(gh api "repos/${ORG}/${REPO}" 2>&1); then
+            echo "::error::Repository ${ORG}/${REPO} not found or not accessible."
+            exit 1
+          fi
+
+          IS_FORK=$(echo "${REPO_JSON}"     | jq -r '.fork')
+          IS_ARCHIVED=$(echo "${REPO_JSON}" | jq -r '.archived')
+
+          if [ "${IS_FORK}" = "true" ]; then
+            echo "::notice::Skipping ${REPO} – it is a fork."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [ "${IS_ARCHIVED}" = "true" ]; then
+            echo "::notice::Skipping ${REPO} – it is archived."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Require the target branch to exist
+          if ! gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" > /dev/null 2>&1; then
+            echo "::notice::Skipping ${REPO} – branch '${TARGET_BRANCH}' not found."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "skip=false" >> "${GITHUB_OUTPUT}"
+          echo "==> ${REPO} is eligible for security audit."
+
+      # -----------------------------------------------------------------------
+      # 2. Enable GitHub security features via the API
+      # -----------------------------------------------------------------------
+      - name: Enable GitHub security features
+        if: steps.check.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+
+          # Enable Dependabot vulnerability alerts
+          if gh api "repos/${ORG}/${REPO}/vulnerability-alerts" \
+               --method PUT; then
+            echo "  Enabled vulnerability alerts for ${REPO}."
+          else
+            echo "::warning::Could not enable vulnerability alerts for ${REPO} – token may lack admin scope."
+          fi
+
+          # Enable automated security fixes (Dependabot security PRs)
+          if gh api "repos/${ORG}/${REPO}/automated-security-fixes" \
+               --method PUT; then
+            echo "  Enabled automated security fixes for ${REPO}."
+          else
+            echo "::warning::Could not enable automated security fixes for ${REPO} – token may lack admin scope."
+          fi
+
+      # -----------------------------------------------------------------------
+      # 3. Detect which security files are missing on the target branch
+      # -----------------------------------------------------------------------
+      - name: Detect missing security files
+        id: detect
+        if: steps.check.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+
+          MISSING=""
+
+          # Check for SECURITY.md
+          if ! gh api \
+               "repos/${ORG}/${REPO}/contents/SECURITY.md?ref=${TARGET_BRANCH}" \
+               > /dev/null 2>&1; then
+            echo "  Missing: SECURITY.md"
+            MISSING="${MISSING}security_md,"
+          else
+            echo "  Present: SECURITY.md"
+          fi
+
+          # Check for .github/dependabot.yml
+          if ! gh api \
+               "repos/${ORG}/${REPO}/contents/.github/dependabot.yml?ref=${TARGET_BRANCH}" \
+               > /dev/null 2>&1; then
+            echo "  Missing: .github/dependabot.yml"
+            MISSING="${MISSING}dependabot_yml,"
+          else
+            echo "  Present: .github/dependabot.yml"
+          fi
+
+          if [ -z "${MISSING}" ]; then
+            echo "changed=false" >> "${GITHUB_OUTPUT}"
+            echo "==> All required security files are present – nothing to add."
+          else
+            echo "changed=true"        >> "${GITHUB_OUTPUT}"
+            echo "missing=${MISSING}"  >> "${GITHUB_OUTPUT}"
+            echo "==> Missing security file(s): ${MISSING}"
+          fi
+
+      # -----------------------------------------------------------------------
+      # 4a. Create branch and open PR (real run)
+      # -----------------------------------------------------------------------
+      - name: Create branch and open PR
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          steps.detect.outputs.changed == 'true' &&
+          inputs.dry_run == false
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+          MISSING: ${{ steps.detect.outputs.missing }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+          BRANCH="security/add-security-files-${{ github.run_id }}"
+
+          # Get the current target branch SHA
+          BASE_SHA=$(gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" \
+                       --jq '.commit.sha')
+
+          # Create new branch off target branch
+          gh api "repos/${ORG}/${REPO}/git/refs" \
+            --method POST \
+            --field "ref=refs/heads/${BRANCH}" \
+            --field "sha=${BASE_SHA}"
+          echo "  Created branch: ${BRANCH} (off ${TARGET_BRANCH})"
+
+          ADDED_FILES=""
+
+          # Add SECURITY.md if missing
+          if echo "${MISSING}" | grep -q "security_md"; then
+            CONTENT=$(base64 -w0 scripts/SECURITY.md)
+            gh api "repos/${ORG}/${REPO}/contents/SECURITY.md" \
+              --method PUT \
+              --field "message=Add SECURITY.md security-disclosure policy" \
+              --field "content=${CONTENT}" \
+              --field "branch=${BRANCH}"
+            echo "  Added SECURITY.md"
+            ADDED_FILES="${ADDED_FILES}- \`SECURITY.md\`\n"
+          fi
+
+          # Add .github/dependabot.yml if missing
+          if echo "${MISSING}" | grep -q "dependabot_yml"; then
+            CONTENT=$(base64 -w0 scripts/dependabot.yml)
+            gh api "repos/${ORG}/${REPO}/contents/.github/dependabot.yml" \
+              --method PUT \
+              --field "message=Add Dependabot configuration for GitHub Actions" \
+              --field "content=${CONTENT}" \
+              --field "branch=${BRANCH}"
+            echo "  Added .github/dependabot.yml"
+            ADDED_FILES="${ADDED_FILES}- \`.github/dependabot.yml\`\n"
+          fi
+
+          # Build PR body from template, inserting the list of added files
+          PR_BODY_FILE=$(mktemp)
+          sed "s|<!-- added-files-placeholder -->|$(printf '%b' "${ADDED_FILES}")|" \
+            scripts/security-audit-pr-body.md > "${PR_BODY_FILE}"
+          printf '\nOpened by the [repo-audits](https://github.com/waldronlab/repo-audits) workflow (run [#%s](%s/%s/actions/runs/%s)).\n' \
+            "${{ github.run_id }}" \
+            "${{ github.server_url }}" \
+            "${{ github.repository }}" \
+            "${{ github.run_id }}" >> "${PR_BODY_FILE}"
+
+          # Open PR
+          gh pr create \
+            --repo "${ORG}/${REPO}" \
+            --base "${TARGET_BRANCH}" \
+            --head "${BRANCH}" \
+            --title "Add missing security infrastructure" \
+            --body-file "${PR_BODY_FILE}"
+
+          rm -f "${PR_BODY_FILE}"
+
+          echo "::notice::PR created in ${ORG}/${REPO} targeting '${TARGET_BRANCH}' (branch: ${BRANCH})."
+
+      # -----------------------------------------------------------------------
+      # 4b. Dry-run summary
+      # -----------------------------------------------------------------------
+      - name: Dry-run summary
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          steps.detect.outputs.changed == 'true' &&
+          inputs.dry_run == true
+        run: |
+          echo "::notice::DRY RUN – would add missing security file(s) to ${{ inputs.repo }}: ${{ steps.detect.outputs.missing }}"
+
+      # -----------------------------------------------------------------------
+      # 4c. Nothing to do
+      # -----------------------------------------------------------------------
+      - name: No changes needed
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          steps.detect.outputs.changed == 'false'
+        run: |
+          echo "::notice::${{ inputs.repo }} already has all required security files – nothing to add."
