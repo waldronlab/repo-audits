@@ -1,0 +1,216 @@
+name: Security Code Review
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: >
+          Repository name within the waldronlab organisation to review
+          (e.g. MultiAssayExperiment)
+        required: true
+        type: string
+      branch:
+        description: >
+          Branch to review (e.g. devel, RELEASE_3_22)
+        required: false
+        type: string
+        default: devel
+      model:
+        description: >
+          LLM model to use for the security review
+          (e.g. gpt-4o, gpt-4o-mini, o1, o3-mini)
+        required: false
+        type: string
+        default: gpt-4o
+      dry_run:
+        description: >
+          Dry run – perform the review and print findings,
+          but do NOT open a GitHub issue in the target repository
+        required: false
+        type: boolean
+        default: false
+
+env:
+  ORG: waldronlab
+
+jobs:
+  security-code-review:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 0. Checkout repo-audits so scripts/ are available locally
+      # -----------------------------------------------------------------------
+      - uses: actions/checkout@v4
+
+      # -----------------------------------------------------------------------
+      # 1. Check eligibility of the target repository
+      # -----------------------------------------------------------------------
+      - name: Check eligibility
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+
+          echo "==> Checking ${ORG}/${REPO} …"
+
+          # --- Fetch repo metadata -------------------------------------------
+          if ! REPO_JSON=$(gh api "repos/${ORG}/${REPO}" 2>&1); then
+            echo "::error::Repository ${ORG}/${REPO} not found or not accessible."
+            exit 1
+          fi
+
+          IS_FORK=$(echo "${REPO_JSON}"     | jq -r '.fork')
+          IS_ARCHIVED=$(echo "${REPO_JSON}" | jq -r '.archived')
+
+          if [ "${IS_FORK}" = "true" ]; then
+            echo "::notice::Skipping ${REPO} – it is a fork."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [ "${IS_ARCHIVED}" = "true" ]; then
+            echo "::notice::Skipping ${REPO} – it is archived."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Require the target branch to exist
+          if ! gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" > /dev/null 2>&1; then
+            echo "::notice::Skipping ${REPO} – branch '${TARGET_BRANCH}' not found."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "skip=false" >> "${GITHUB_OUTPUT}"
+          echo "==> ${REPO} is eligible for security code review."
+
+      # -----------------------------------------------------------------------
+      # 2. Clone the target repository (shallow, target branch only)
+      # -----------------------------------------------------------------------
+      - name: Clone target repository
+        if: steps.check.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+
+          git clone \
+            --depth 1 \
+            --branch "${TARGET_BRANCH}" \
+            "https://x-access-token:${GH_TOKEN}@github.com/${ORG}/${REPO}.git" \
+            /tmp/target-repo
+
+          echo "==> Cloned ${ORG}/${REPO}@${TARGET_BRANCH} to /tmp/target-repo"
+
+      # -----------------------------------------------------------------------
+      # 3. Set up Python and install dependencies
+      # -----------------------------------------------------------------------
+      - name: Set up Python
+        if: steps.check.outputs.skip == 'false'
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python dependencies
+        if: steps.check.outputs.skip == 'false'
+        run: pip install 'openai>=1.0.0'
+
+      # -----------------------------------------------------------------------
+      # 4. Run AI security review
+      # -----------------------------------------------------------------------
+      - name: Run AI security review
+        if: steps.check.outputs.skip == 'false'
+        env:
+          REPO_DIR: /tmp/target-repo
+          INSTRUCTIONS_PATH: ${{ github.workspace }}/scripts/instructions.md
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          MODEL: ${{ inputs.model }}
+          OUTPUT_FILE: /tmp/security-review.md
+          REPO_NAME: ${{ env.ORG }}/${{ inputs.repo }}
+          BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          python "${{ github.workspace }}/scripts/security_review.py"
+          echo "==> Security review completed."
+
+      # -----------------------------------------------------------------------
+      # 5a. Open or refresh GitHub issue in the target repo (real run)
+      # -----------------------------------------------------------------------
+      - name: Open or refresh GitHub issue
+        if: steps.check.outputs.skip == 'false' && inputs.dry_run == false
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+          ISSUE_TITLE="Security code review"
+
+          # Close any existing open issue with the same title to avoid accumulation
+          EXISTING=$(gh issue list \
+            --repo "${ORG}/${REPO}" \
+            --state open \
+            --search "${ISSUE_TITLE} in:title" \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || true)
+
+          if [ -n "${EXISTING}" ]; then
+            echo "==> Closing stale issue #${EXISTING} before opening a fresh one."
+            gh issue close "${EXISTING}" \
+              --repo "${ORG}/${REPO}" \
+              --comment "$(printf 'Superseded by a new security code review.\n\nNew run: [#%s](%s/%s/actions/runs/%s).' \
+                "${{ github.run_id }}" \
+                "${{ github.server_url }}" \
+                "${{ github.repository }}" \
+                "${{ github.run_id }}")"
+          fi
+
+          # Append run attribution to the review body
+          BODY_FILE=$(mktemp)
+          cat /tmp/security-review.md > "${BODY_FILE}"
+          printf '\n---\n_Generated by the [repo-audits](https://github.com/waldronlab/repo-audits) Security Code Review workflow (run [#%s](%s/%s/actions/runs/%s)) using model `%s` on branch `%s`._\n' \
+            "${{ github.run_id }}" \
+            "${{ github.server_url }}" \
+            "${{ github.repository }}" \
+            "${{ github.run_id }}" \
+            "${{ inputs.model }}" \
+            "${{ inputs.branch }}" >> "${BODY_FILE}"
+
+          # Create the issue; try with the 'security' label first, fall back without
+          ISSUE_URL=$(gh issue create \
+            --repo "${ORG}/${REPO}" \
+            --title "${ISSUE_TITLE}" \
+            --body-file "${BODY_FILE}" \
+            --label "security" 2>/dev/null \
+            || gh issue create \
+              --repo "${ORG}/${REPO}" \
+              --title "${ISSUE_TITLE}" \
+              --body-file "${BODY_FILE}")
+
+          rm -f "${BODY_FILE}"
+          echo "::notice::Security review issue opened: ${ISSUE_URL}"
+
+      # -----------------------------------------------------------------------
+      # 5b. Dry-run: print the review to the log
+      # -----------------------------------------------------------------------
+      - name: Dry-run summary
+        if: steps.check.outputs.skip == 'false' && inputs.dry_run == true
+        run: |
+          echo "::notice::DRY RUN – review complete; no issue was opened in ${{ inputs.repo }}."
+          echo "==> Review output:"
+          cat /tmp/security-review.md
+
+      # -----------------------------------------------------------------------
+      # 5c. Skipped
+      # -----------------------------------------------------------------------
+      - name: Skipped
+        if: steps.check.outputs.skip == 'true'
+        run: |
+          echo "::notice::${{ inputs.repo }} was skipped – not eligible for security code review."

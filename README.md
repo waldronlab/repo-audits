@@ -174,19 +174,99 @@ All missing files are bundled into a single PR against the target branch.
 
 ---
 
-## Required secret
+### 4. Security Code Review (`security-code-review.yml`)
 
-Both workflows use a secret named **`AUDIT_PAT`** – a GitHub
+Clones a single target repository, sends its R and native (C/C++/Fortran) source
+files to an LLM for security analysis using
+[`scripts/instructions.md`](scripts/instructions.md) as the system prompt, and
+opens a GitHub issue in the target repository with the findings.
+
+#### What the review covers
+
+The LLM is instructed to look for:
+
+- **Security vulnerabilities** – SQL/command injection, path traversal, unsafe
+  `eval()`/`parse()`, hardcoded credentials, insecure randomness, XSS, unsafe
+  file operations, and more.
+- **Native code safety** – buffer overflows, use-after-free, integer overflow,
+  unsafe C functions (`strcpy`, `sprintf`, `gets`, …), format string bugs, and
+  unsafe pointer arithmetic in any `src/` code.
+- **Code quality** – missing input validation, leaky error handling, deprecated
+  functions, and insufficient access controls.
+- **Dependencies** – vulnerable or unmaintained imports.
+
+Each finding is tagged with a standardised severity (Critical/High/Medium/Low)
+and issue-type label, and includes a recommended fix.
+
+#### Files reviewed
+
+| Location | Contents |
+|----------|----------|
+| `DESCRIPTION`, `NAMESPACE` | Package metadata |
+| `src/` | C, C++, Fortran source and headers |
+| `R/` | All R source files |
+
+Files are included in priority order (native code before R) up to a 200 000
+character limit; any remainder is noted in the issue.
+
+#### Eligibility checks (a repo is skipped when …)
+
+| Condition | Action |
+|-----------|--------|
+| Not in `waldronlab` | Error |
+| Is a fork | Skip |
+| Is archived | Skip |
+| Target branch not found | Skip |
+
+#### Issue management
+
+- A GitHub issue titled **"Security code review"** is opened in the target
+  repository.
+- If an open issue with that title already exists it is closed (with a cross-
+  reference comment) before the fresh one is created, so at most one open
+  security review issue exists per repository at any time.
+- The issue body includes the full LLM output plus a footer linking back to
+  this workflow run.
+
+#### Running the workflow
+
+1. Go to **Actions → Security Code Review** in this repository.
+2. Click **Run workflow**.
+3. Fill in the inputs:
+   - **`repo`** *(required)* – repository name within `waldronlab`,
+     e.g. `MultiAssayExperiment`.
+   - **`branch`** *(optional, default `devel`)* – branch to clone and review.
+   - **`model`** *(optional, default `gpt-4o`)* – LLM model to use,
+     e.g. `gpt-4o`, `gpt-4o-mini`, `o1`, `o3-mini`.
+   - **`dry_run`** *(optional, default `false`)* – when `true`, the workflow
+     performs the full review and prints the output to the log, but does
+     **not** open a GitHub issue.
+
+#### Required additional secret
+
+The `Security Code Review` workflow requires **`OPENAI_API_KEY`** in addition
+to `AUDIT_PAT`.  Any OpenAI-compatible provider can be used; set the optional
+**`OPENAI_API_BASE`** secret or environment variable to point to an alternative
+endpoint (e.g. Azure OpenAI, a self-hosted model, or GitHub Models).
+
+---
+
+## Required secrets
+
+All workflows use a secret named **`AUDIT_PAT`** – a GitHub
 [Personal Access Token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
 (classic) with at least the **`repo`** scope, stored in the `waldronlab/repo-audits`
 repository secrets (or organisation secrets).
 
+The `Security Code Review` workflow additionally requires **`OPENAI_API_KEY`**.
+
 The token must have write access to the target repositories in `waldronlab` so
-it can create branches, commit, and open pull requests.
+it can create branches, commit, and open pull requests or issues.
 
 > **Tip:** A [GitHub App](https://docs.github.com/en/apps) token with
-> `contents: write` and `pull-requests: write` permissions installed on the
-> `waldronlab` organisation is the preferred long-term alternative to a PAT.
+> `contents: write`, `pull-requests: write`, and `issues: write` permissions
+> installed on the `waldronlab` organisation is the preferred long-term
+> alternative to a PAT.
 
 ## Repository layout
 
@@ -196,14 +276,17 @@ it can create branches, commit, and open pull requests.
     audit-single-repo-funding.yml   # Audit 1: add missing fnd entries to DESCRIPTION
     migrate-pr-check-to-ci.yml      # Audit 2: replace pr_check.yml with ci.yml wrapper
     security-audit.yml              # Audit 3: add missing security infrastructure
+    security-code-review.yml        # Audit 4: AI-powered security code review
 scripts/
   audit_single_repo.R               # R script: parses/updates Authors@R
   ci.yml                            # ci.yml template copied to target repos
   dependabot.yml                    # dependabot.yml template copied to target repos
+  instructions.md                   # LLM system prompt for the security code review
   migrate-pr-check-pr-body.md       # PR body template for the migration audit
   nih_institutes.json               # NIH institute code → agency name map
   SECURITY.md                       # SECURITY.md template copied to target repos
   security-audit-pr-body.md         # PR body template for the security audit
+  security_review.py                # Python script: collects source files, calls LLM
 README.md
 ```
 
