@@ -1,0 +1,243 @@
+name: Update CITATION.cff for a package
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: >
+          Repository name within the waldronlab organisation to update
+          CITATION.cff for (e.g. MultiAssayExperiment)
+        required: true
+        type: string
+      branch:
+        description: >
+          Target branch to search and open PRs against
+          (e.g. devel, RELEASE_3_22)
+        required: false
+        type: string
+        default: devel
+      dry_run:
+        description: >
+          Dry run – perform all checks and show what would change,
+          but do NOT push branches, commits, or open PRs
+        required: false
+        type: boolean
+        default: false
+
+env:
+  ORG: waldronlab
+
+jobs:
+  update-citation-cff:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+
+    steps:
+      # -----------------------------------------------------------------------
+      # 0. Checkout repo-audits@devel so scripts/ are available locally
+      # -----------------------------------------------------------------------
+      - uses: actions/checkout@v4
+        with:
+          ref: devel
+
+      # -----------------------------------------------------------------------
+      # 1. Check eligibility of the target repository
+      # -----------------------------------------------------------------------
+      - name: Check eligibility
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+
+          echo "==> Checking ${ORG}/${REPO} …"
+
+          # --- Fetch repo metadata -------------------------------------------
+          if ! REPO_JSON=$(gh api "repos/${ORG}/${REPO}" 2>&1); then
+            echo "::error::Repository ${ORG}/${REPO} not found or not accessible."
+            exit 1
+          fi
+
+          IS_FORK=$(echo "${REPO_JSON}"     | jq -r '.fork')
+          IS_ARCHIVED=$(echo "${REPO_JSON}" | jq -r '.archived')
+
+          if [ "${IS_FORK}" = "true" ]; then
+            echo "::notice::Skipping ${REPO} – it is a fork."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          if [ "${IS_ARCHIVED}" = "true" ]; then
+            echo "::notice::Skipping ${REPO} – it is archived."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Require the target branch to exist
+          if ! gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" > /dev/null 2>&1; then
+            echo "::notice::Skipping ${REPO} – branch '${TARGET_BRANCH}' not found."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Require DESCRIPTION to exist on the target branch (R package check)
+          if ! gh api \
+            "repos/${ORG}/${REPO}/contents/DESCRIPTION?ref=${TARGET_BRANCH}" \
+            > /dev/null 2>&1; then
+            echo "::notice::Skipping ${REPO} – DESCRIPTION not found on '${TARGET_BRANCH}' (not an R package?)."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # Skip if an update-citation-cff PR already exists
+          EXISTING_PR=$(gh pr list \
+            --repo "${ORG}/${REPO}" \
+            --state open \
+            --search "Update CITATION.cff in:title" \
+            --json number \
+            --jq '.[0].number' 2>/dev/null || true)
+          if [ -n "${EXISTING_PR}" ]; then
+            echo "::notice::Skipping ${REPO} – update-citation-cff PR #${EXISTING_PR} already open."
+            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          echo "skip=false" >> "${GITHUB_OUTPUT}"
+          echo "==> ${REPO} is eligible – CITATION.cff will be updated."
+
+      # -----------------------------------------------------------------------
+      # 2. Set up R (only when we will actually run)
+      # -----------------------------------------------------------------------
+      - uses: r-lib/actions/setup-r@v2
+        if: steps.check.outputs.skip == 'false'
+        with:
+          use-public-rspm: true
+
+      - uses: r-lib/actions/setup-r-dependencies@v2
+        if: steps.check.outputs.skip == 'false'
+        with:
+          extra-packages: |
+            any::cffr
+            any::V8
+
+      # -----------------------------------------------------------------------
+      # 3. Create branch and open PR (real run)
+      # -----------------------------------------------------------------------
+      - name: Create branch and open PR
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          inputs.dry_run == false
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+          BRANCH="ci/update-citation-cff-${{ github.run_id }}"
+          WORK_DIR=$(mktemp -d)
+
+          # ── Clone the target repo at the target branch ──
+          gh repo clone "${ORG}/${REPO}" "${WORK_DIR}" -- \
+            --branch "${TARGET_BRANCH}" --depth 1
+          echo "  Cloned ${ORG}/${REPO}@${TARGET_BRANCH}"
+
+          # ── Generate CITATION.cff inside the cloned repo ──
+          Rscript -e "
+            library(cffr)
+            setwd('${WORK_DIR}')
+            cff_write()
+          "
+          echo "  Generated CITATION.cff"
+
+          # ── Compare with existing CITATION.cff on the target branch ──
+          NEW_CONTENT=$(base64 -w0 < "${WORK_DIR}/CITATION.cff")
+
+          EXISTING_CONTENT=$(gh api \
+            "repos/${ORG}/${REPO}/contents/CITATION.cff?ref=${TARGET_BRANCH}" \
+            --jq '.content' 2>/dev/null | tr -d '\n' || true)
+
+          if [ "${NEW_CONTENT}" = "${EXISTING_CONTENT}" ]; then
+            echo "::notice::CITATION.cff is already up to date in ${ORG}/${REPO} – no PR needed."
+            rm -rf "${WORK_DIR}"
+            exit 0
+          fi
+
+          # ── Get existing CITATION.cff SHA (needed for PUT update, if present) ──
+          CITATION_SHA=$(gh api \
+            "repos/${ORG}/${REPO}/contents/CITATION.cff?ref=${TARGET_BRANCH}" \
+            --jq '.sha' 2>/dev/null || true)
+
+          # ── Create a branch off the target branch ──
+          BASE_SHA=$(gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" \
+                       --jq '.commit.sha')
+
+          gh api "repos/${ORG}/${REPO}/git/refs" \
+            --method POST \
+            --field "ref=refs/heads/${BRANCH}" \
+            --field "sha=${BASE_SHA}"
+          echo "  Created branch: ${BRANCH} (off ${TARGET_BRANCH})"
+
+          # ── Create or update CITATION.cff on the new branch ──
+          if [ -n "${CITATION_SHA}" ]; then
+            COMMIT_MSG="Update CITATION.cff"
+            gh api "repos/${ORG}/${REPO}/contents/CITATION.cff" \
+              --method PUT \
+              --field "message=${COMMIT_MSG}" \
+              --field "content=${NEW_CONTENT}" \
+              --field "sha=${CITATION_SHA}" \
+              --field "branch=${BRANCH}"
+            echo "  Updated CITATION.cff"
+          else
+            COMMIT_MSG="Add CITATION.cff"
+            gh api "repos/${ORG}/${REPO}/contents/CITATION.cff" \
+              --method PUT \
+              --field "message=${COMMIT_MSG}" \
+              --field "content=${NEW_CONTENT}" \
+              --field "branch=${BRANCH}"
+            echo "  Added CITATION.cff"
+          fi
+
+          rm -rf "${WORK_DIR}"
+
+          # ── Build PR body ──
+          PR_BODY_FILE=$(mktemp)
+          cp scripts/update-citation-cff-pr-body.md "${PR_BODY_FILE}"
+          printf '\nOpened by the [repo-audits](https://github.com/waldronlab/repo-audits) workflow (run [#%s](%s/%s/actions/runs/%s)).\n' \
+            "${{ github.run_id }}" \
+            "${{ github.server_url }}" \
+            "${{ github.repository }}" \
+            "${{ github.run_id }}" >> "${PR_BODY_FILE}"
+
+          # ── Open PR ──
+          gh pr create \
+            --repo "${ORG}/${REPO}" \
+            --base "${TARGET_BRANCH}" \
+            --head "${BRANCH}" \
+            --title "Update CITATION.cff" \
+            --body-file "${PR_BODY_FILE}"
+
+          rm -f "${PR_BODY_FILE}"
+
+          echo "::notice::PR created in ${ORG}/${REPO} targeting '${TARGET_BRANCH}' (branch: ${BRANCH})."
+
+      # -----------------------------------------------------------------------
+      # 4. Dry-run summary
+      # -----------------------------------------------------------------------
+      - name: Dry-run summary
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          inputs.dry_run == true
+        run: |
+          echo "::notice::DRY RUN – would create update-citation-cff PR in \
+          ${{ inputs.repo }} targeting '${{ inputs.branch }}'."
+
+      # -----------------------------------------------------------------------
+      # 5. Nothing to do
+      # -----------------------------------------------------------------------
+      - name: No action needed
+        if: steps.check.outputs.skip == 'true'
+        run: |
+          echo "::notice::${{ inputs.repo }} does not need CITATION.cff updated – skipped."
