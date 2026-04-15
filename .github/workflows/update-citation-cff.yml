@@ -92,21 +92,25 @@ jobs:
             exit 0
           fi
 
-          # Skip if an update-citation-cff PR already exists
-          EXISTING_PR=$(gh pr list \
+          # Capture any existing open update-citation-cff PR so we can update it
+          # instead of creating a new one.
+          EXISTING_PR_DATA=$(gh pr list \
             --repo "${ORG}/${REPO}" \
             --state open \
             --search "Update CITATION.cff in:title" \
-            --json number \
-            --jq '.[0].number' 2>/dev/null || true)
-          if [ -n "${EXISTING_PR}" ]; then
-            echo "::notice::Skipping ${REPO} – update-citation-cff PR #${EXISTING_PR} already open."
-            echo "skip=true" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
+            --json number,headRefName \
+            --jq '.[0] // {}' 2>/dev/null || echo '{}')
+          EXISTING_PR=$(echo "${EXISTING_PR_DATA}" | jq -r '.number // empty')
+          EXISTING_BRANCH=$(echo "${EXISTING_PR_DATA}" | jq -r '.headRefName // empty')
 
+          echo "existing_pr=${EXISTING_PR}" >> "${GITHUB_OUTPUT}"
+          echo "existing_branch=${EXISTING_BRANCH}" >> "${GITHUB_OUTPUT}"
           echo "skip=false" >> "${GITHUB_OUTPUT}"
-          echo "==> ${REPO} is eligible – CITATION.cff will be updated."
+          if [ -n "${EXISTING_PR}" ]; then
+            echo "==> Found existing PR #${EXISTING_PR} – will update it."
+          else
+            echo "==> ${REPO} is eligible – CITATION.cff will be added or updated."
+          fi
 
       # -----------------------------------------------------------------------
       # 2. Set up R (only when we will actually run)
@@ -119,123 +123,233 @@ jobs:
       - uses: r-lib/actions/setup-r-dependencies@v2
         if: steps.check.outputs.skip == 'false'
         with:
+          # packages: "" prevents setup-r-dependencies from looking for a
+          # DESCRIPTION in the repo-audits checkout directory (which has none).
+          # Only the explicitly listed extra-packages are installed.
+          packages: ""
           extra-packages: |
             any::cffr
             any::V8
 
       # -----------------------------------------------------------------------
-      # 3. Create branch and open PR (real run)
+      # 3. Generate CITATION.cff and auto citation text
+      #    Runs for both real runs and dry runs so both paths can show the auto
+      #    citation in their output.
       # -----------------------------------------------------------------------
-      - name: Create branch and open PR
-        if: >
-          steps.check.outputs.skip == 'false' &&
-          inputs.dry_run == false
+      - name: Generate CITATION.cff and auto citation
+        id: generate
+        if: steps.check.outputs.skip == 'false'
         env:
           GH_TOKEN: ${{ secrets.AUDIT_PAT }}
           TARGET_BRANCH: ${{ inputs.branch }}
+          EXISTING_BRANCH: ${{ steps.check.outputs.existing_branch }}
         run: |
           set -euo pipefail
           REPO="${{ inputs.repo }}"
-          BRANCH="ci/update-citation-cff-${{ github.run_id }}"
+
           WORK_DIR=$(mktemp -d)
+          AUTO_CIT_FILE=$(mktemp)
+          NEW_CFF_B64_FILE=$(mktemp)
 
           # ── Clone the target repo at the target branch ──
           gh repo clone "${ORG}/${REPO}" "${WORK_DIR}" -- \
             --branch "${TARGET_BRANCH}" --depth 1
           echo "  Cloned ${ORG}/${REPO}@${TARGET_BRANCH}"
 
-          # ── Generate CITATION.cff inside the cloned repo ──
-          Rscript -e "
-            library(cffr)
-            setwd('${WORK_DIR}')
-            cff_write()
-          "
-          echo "  Generated CITATION.cff"
+          # ── R script: generate CITATION.cff and auto citation ──
+          # inst/CITATION (if present) becomes the preferred-citation in CFF.
+          # The auto citation is derived solely from DESCRIPTION, mirroring
+          # citation("pkg", auto = TRUE).
+          R_SCRIPT=$(mktemp --suffix=.R)
+          cat > "${R_SCRIPT}" << 'REOF'
+          library(cffr)
+          setwd(Sys.getenv("WORK_DIR"))
+          cff_write()
+          cff_obj                       <- cff()
+          cff_obj[["preferred-citation"]] <- NULL
+          auto_bib  <- cff_to_bibentry(cff_obj)
+          writeLines(format(auto_bib, style = "R"), Sys.getenv("AUTO_CIT_FILE"))
+          REOF
+          WORK_DIR="${WORK_DIR}" AUTO_CIT_FILE="${AUTO_CIT_FILE}" Rscript "${R_SCRIPT}"
+          rm -f "${R_SCRIPT}"
+          echo "  Generated CITATION.cff and auto citation"
 
-          # ── Compare with existing CITATION.cff on the target branch ──
-          NEW_CONTENT=$(base64 -w0 < "${WORK_DIR}/CITATION.cff")
+          # ── Base64-encode the new CITATION.cff ──
+          base64 -w0 < "${WORK_DIR}/CITATION.cff" > "${NEW_CFF_B64_FILE}"
 
-          EXISTING_CONTENT=$(gh api \
-            "repos/${ORG}/${REPO}/contents/CITATION.cff?ref=${TARGET_BRANCH}" \
+          # ── Compare against the current state on the relevant ref ──
+          # Use the existing PR branch if one is open; otherwise the target branch.
+          COMPARE_REF="${EXISTING_BRANCH:-${TARGET_BRANCH}}"
+          CURRENT_B64=$(gh api \
+            "repos/${ORG}/${REPO}/contents/CITATION.cff?ref=${COMPARE_REF}" \
             --jq '.content' 2>/dev/null | tr -d '\n' || true)
+          NEW_B64=$(cat "${NEW_CFF_B64_FILE}")
 
-          if [ "${NEW_CONTENT}" = "${EXISTING_CONTENT}" ]; then
+          CFF_CHANGED=false
+          [ "${NEW_B64}" != "${CURRENT_B64}" ] && CFF_CHANGED=true
+
+          echo "work_dir=${WORK_DIR}" >> "${GITHUB_OUTPUT}"
+          echo "auto_cit_file=${AUTO_CIT_FILE}" >> "${GITHUB_OUTPUT}"
+          echo "new_cff_b64_file=${NEW_CFF_B64_FILE}" >> "${GITHUB_OUTPUT}"
+          echo "cff_changed=${CFF_CHANGED}" >> "${GITHUB_OUTPUT}"
+          echo "  CFF changed: ${CFF_CHANGED}"
+
+      # -----------------------------------------------------------------------
+      # 4. Create or update PR (real run)
+      # -----------------------------------------------------------------------
+      - name: Create or update PR
+        if: >
+          steps.check.outputs.skip == 'false' &&
+          inputs.dry_run == false
+        env:
+          GH_TOKEN: ${{ secrets.AUDIT_PAT }}
+          TARGET_BRANCH: ${{ inputs.branch }}
+          EXISTING_PR: ${{ steps.check.outputs.existing_pr }}
+          EXISTING_BRANCH: ${{ steps.check.outputs.existing_branch }}
+          CFF_CHANGED: ${{ steps.generate.outputs.cff_changed }}
+          WORK_DIR: ${{ steps.generate.outputs.work_dir }}
+          AUTO_CIT_FILE: ${{ steps.generate.outputs.auto_cit_file }}
+          NEW_CFF_B64_FILE: ${{ steps.generate.outputs.new_cff_b64_file }}
+        run: |
+          set -euo pipefail
+          REPO="${{ inputs.repo }}"
+          NEW_CONTENT=$(cat "${NEW_CFF_B64_FILE}")
+
+          # ── Nothing to do when there is no existing PR and the file is current ──
+          if [ -z "${EXISTING_PR}" ] && [ "${CFF_CHANGED}" = "false" ]; then
             echo "::notice::CITATION.cff is already up to date in ${ORG}/${REPO} – no PR needed."
             rm -rf "${WORK_DIR}"
             exit 0
           fi
 
-          # ── Get existing CITATION.cff SHA (needed for PUT update, if present) ──
-          CITATION_SHA=$(gh api \
-            "repos/${ORG}/${REPO}/contents/CITATION.cff?ref=${TARGET_BRANCH}" \
-            --jq '.sha' 2>/dev/null || true)
-
-          # ── Create a branch off the target branch ──
-          BASE_SHA=$(gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" \
-                       --jq '.commit.sha')
-
-          gh api "repos/${ORG}/${REPO}/git/refs" \
-            --method POST \
-            --field "ref=refs/heads/${BRANCH}" \
-            --field "sha=${BASE_SHA}"
-          echo "  Created branch: ${BRANCH} (off ${TARGET_BRANCH})"
-
-          # ── Create or update CITATION.cff on the new branch ──
-          if [ -n "${CITATION_SHA}" ]; then
-            COMMIT_MSG="Update CITATION.cff"
-            gh api "repos/${ORG}/${REPO}/contents/CITATION.cff" \
-              --method PUT \
-              --field "message=${COMMIT_MSG}" \
-              --field "content=${NEW_CONTENT}" \
-              --field "sha=${CITATION_SHA}" \
-              --field "branch=${BRANCH}"
-            echo "  Updated CITATION.cff"
-          else
-            COMMIT_MSG="Add CITATION.cff"
-            gh api "repos/${ORG}/${REPO}/contents/CITATION.cff" \
-              --method PUT \
-              --field "message=${COMMIT_MSG}" \
-              --field "content=${NEW_CONTENT}" \
-              --field "branch=${BRANCH}"
-            echo "  Added CITATION.cff"
-          fi
-
-          rm -rf "${WORK_DIR}"
-
           # ── Build PR body ──
           PR_BODY_FILE=$(mktemp)
           cp scripts/update-citation-cff-pr-body.md "${PR_BODY_FILE}"
+
+          # Append auto citation section
+          printf '\n## Automatic citation\n\nThe auto-generated citation derived from `DESCRIPTION` (equivalent to `citation("%s", auto = TRUE)`):\n\n```r\n' "${REPO}" >> "${PR_BODY_FILE}"
+          cat "${AUTO_CIT_FILE}" >> "${PR_BODY_FILE}"
+          printf '\n```\n' >> "${PR_BODY_FILE}"
+
           printf '\nOpened by the [repo-audits](https://github.com/waldronlab/repo-audits) workflow (run [#%s](%s/%s/actions/runs/%s)).\n' \
             "${{ github.run_id }}" \
             "${{ github.server_url }}" \
             "${{ github.repository }}" \
             "${{ github.run_id }}" >> "${PR_BODY_FILE}"
 
-          # ── Open PR ──
-          gh pr create \
-            --repo "${ORG}/${REPO}" \
-            --base "${TARGET_BRANCH}" \
-            --head "${BRANCH}" \
-            --title "Update CITATION.cff" \
-            --body-file "${PR_BODY_FILE}"
+          # ── Updating an existing PR ──
+          if [ -n "${EXISTING_PR}" ]; then
+            BRANCH="${EXISTING_BRANCH}"
 
+            if [ "${CFF_CHANGED}" = "true" ]; then
+              # Push updated CITATION.cff to the existing branch
+              CITATION_SHA=$(gh api \
+                "repos/${ORG}/${REPO}/contents/CITATION.cff?ref=${BRANCH}" \
+                --jq '.sha' 2>/dev/null || true)
+
+              if [ -n "${CITATION_SHA}" ]; then
+                gh api "repos/${ORG}/${REPO}/contents/CITATION.cff" \
+                  --method PUT \
+                  --field "message=Update CITATION.cff" \
+                  --field "content=${NEW_CONTENT}" \
+                  --field "sha=${CITATION_SHA}" \
+                  --field "branch=${BRANCH}"
+              else
+                gh api "repos/${ORG}/${REPO}/contents/CITATION.cff" \
+                  --method PUT \
+                  --field "message=Add CITATION.cff" \
+                  --field "content=${NEW_CONTENT}" \
+                  --field "branch=${BRANCH}"
+              fi
+              echo "  Updated CITATION.cff on branch ${BRANCH}"
+            fi
+
+            # Always refresh the PR body so the auto citation stays current
+            gh pr edit "${EXISTING_PR}" \
+              --repo "${ORG}/${REPO}" \
+              --body-file "${PR_BODY_FILE}"
+
+            echo "::notice::Updated PR #${EXISTING_PR} in ${ORG}/${REPO} (branch: ${BRANCH}, cff_changed: ${CFF_CHANGED})."
+
+          # ── Creating a new PR ──
+          else
+            BRANCH="ci/update-citation-cff-${{ github.run_id }}"
+
+            BASE_SHA=$(gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" \
+                         --jq '.commit.sha')
+            gh api "repos/${ORG}/${REPO}/git/refs" \
+              --method POST \
+              --field "ref=refs/heads/${BRANCH}" \
+              --field "sha=${BASE_SHA}"
+            echo "  Created branch: ${BRANCH} (off ${TARGET_BRANCH})"
+
+            CITATION_SHA=$(gh api \
+              "repos/${ORG}/${REPO}/contents/CITATION.cff?ref=${TARGET_BRANCH}" \
+              --jq '.sha' 2>/dev/null || true)
+
+            if [ -n "${CITATION_SHA}" ]; then
+              COMMIT_MSG="Update CITATION.cff"
+              gh api "repos/${ORG}/${REPO}/contents/CITATION.cff" \
+                --method PUT \
+                --field "message=${COMMIT_MSG}" \
+                --field "content=${NEW_CONTENT}" \
+                --field "sha=${CITATION_SHA}" \
+                --field "branch=${BRANCH}"
+              echo "  Updated CITATION.cff"
+            else
+              COMMIT_MSG="Add CITATION.cff"
+              gh api "repos/${ORG}/${REPO}/contents/CITATION.cff" \
+                --method PUT \
+                --field "message=${COMMIT_MSG}" \
+                --field "content=${NEW_CONTENT}" \
+                --field "branch=${BRANCH}"
+              echo "  Added CITATION.cff"
+            fi
+
+            gh pr create \
+              --repo "${ORG}/${REPO}" \
+              --base "${TARGET_BRANCH}" \
+              --head "${BRANCH}" \
+              --title "Update CITATION.cff" \
+              --body-file "${PR_BODY_FILE}"
+
+            echo "::notice::PR created in ${ORG}/${REPO} targeting '${TARGET_BRANCH}' (branch: ${BRANCH})."
+          fi
+
+          rm -rf "${WORK_DIR}"
           rm -f "${PR_BODY_FILE}"
 
-          echo "::notice::PR created in ${ORG}/${REPO} targeting '${TARGET_BRANCH}' (branch: ${BRANCH})."
-
       # -----------------------------------------------------------------------
-      # 4. Dry-run summary
+      # 5. Dry-run summary
       # -----------------------------------------------------------------------
       - name: Dry-run summary
         if: >
           steps.check.outputs.skip == 'false' &&
           inputs.dry_run == true
+        env:
+          CFF_CHANGED: ${{ steps.generate.outputs.cff_changed }}
+          EXISTING_PR: ${{ steps.check.outputs.existing_pr }}
+          AUTO_CIT_FILE: ${{ steps.generate.outputs.auto_cit_file }}
+          WORK_DIR: ${{ steps.generate.outputs.work_dir }}
         run: |
-          echo "::notice::DRY RUN – would create update-citation-cff PR in \
-          ${{ inputs.repo }} targeting '${{ inputs.branch }}'."
+          REPO="${{ inputs.repo }}"
+
+          if [ -n "${EXISTING_PR}" ]; then
+            echo "::notice::DRY RUN – would update PR #${EXISTING_PR} body in ${REPO} (cff_changed: ${CFF_CHANGED})."
+          elif [ "${CFF_CHANGED}" = "true" ]; then
+            echo "::notice::DRY RUN – would create update-citation-cff PR in ${REPO} targeting '${{ inputs.branch }}'."
+          else
+            echo "::notice::DRY RUN – CITATION.cff is already up to date in ${REPO}; no PR needed."
+          fi
+
+          echo "==> Auto citation (citation(\"${REPO}\", auto = TRUE)):"
+          cat "${AUTO_CIT_FILE}"
+
+          rm -f "${AUTO_CIT_FILE}"
+          rm -rf "${WORK_DIR}"
 
       # -----------------------------------------------------------------------
-      # 5. Nothing to do
+      # 6. Nothing to do
       # -----------------------------------------------------------------------
       - name: No action needed
         if: steps.check.outputs.skip == 'true'
