@@ -1,12 +1,12 @@
-name: Add CITATION.cff for a package
+name: Add or update CITATION.cff for a package
 
 on:
   workflow_dispatch:
     inputs:
       repo:
         description: >
-          Repository name within the waldronlab organisation to add
-          CITATION.cff to (e.g. MultiAssayExperiment)
+          Repository name within the waldronlab organisation to add or update
+          CITATION.cff for (e.g. MultiAssayExperiment)
         required: true
         type: string
       branch:
@@ -28,7 +28,7 @@ env:
   ORG: waldronlab
 
 jobs:
-  add-citation-cff:
+  update-citation-cff:
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -92,17 +92,8 @@ jobs:
             exit 0
           fi
 
-          # Skip if CITATION.cff already exists – this workflow only adds it
-          if gh api \
-            "repos/${ORG}/${REPO}/contents/CITATION.cff?ref=${TARGET_BRANCH}" \
-            > /dev/null 2>&1; then
-            echo "::notice::Skipping ${REPO} – CITATION.cff already exists on '${TARGET_BRANCH}'."
-            echo "skip=true" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
           echo "skip=false" >> "${GITHUB_OUTPUT}"
-          echo "==> ${REPO} is eligible – CITATION.cff will be added."
+          echo "==> ${REPO} is eligible – CITATION.cff will be added or updated."
 
       # -----------------------------------------------------------------------
       # 2. Set up R (only when we will actually run)
@@ -126,8 +117,10 @@ jobs:
       # -----------------------------------------------------------------------
       # 3. Generate CITATION.cff via cffr::cff_write()
       #
-      #    If inst/CITATION exists in the repo it will be used automatically
-      #    by cff_write() as the preferred-citation; no extra handling needed.
+      #    The auto-citation (derived from DESCRIPTION) is included as a
+      #    references entry so both the preferred-citation (from inst/CITATION
+      #    if present, otherwise from DESCRIPTION) and the software citation
+      #    appear in CITATION.cff.
       # -----------------------------------------------------------------------
       - name: Generate CITATION.cff
         id: generate
@@ -147,12 +140,37 @@ jobs:
             --branch "${TARGET_BRANCH}" --depth 1
           echo "  Cloned ${ORG}/${REPO}@${TARGET_BRANCH}"
 
+          # ── Check whether CITATION.cff already exists (needed for the PUT SHA) ──
+          # Treat any failure (404 = not found, or other) as "does not exist";
+          # a genuine permission error will surface in the commit step.
+          if EXISTING_CFF_SHA=$(gh api \
+              "repos/${ORG}/${REPO}/contents/CITATION.cff?ref=${TARGET_BRANCH}" \
+              --jq '.sha' 2>/dev/null) && [ -n "${EXISTING_CFF_SHA}" ]; then
+            echo "  CITATION.cff already exists (SHA: ${EXISTING_CFF_SHA}) – will update"
+            CFF_EXISTS=true
+          else
+            EXISTING_CFF_SHA=""
+            echo "  CITATION.cff does not yet exist – will add"
+            CFF_EXISTS=false
+          fi
+
           # ── Generate CITATION.cff ──
           R_SCRIPT=$(mktemp --suffix=.R)
           cat > "${R_SCRIPT}" << 'REOF'
           library(cffr)
           setwd(Sys.getenv("WORK_DIR"))
-          cff_write()
+
+          # Include the auto-citation from DESCRIPTION as a references entry.
+          # citation(".", auto = TRUE) reads DESCRIPTION from the current directory
+          # without requiring the package to be installed.
+          # as_cff() converts the bibentry to CFF format; as.list() ensures the
+          # result is properly nested as individual entries under "references".
+          cit <- citation(".", auto = TRUE)
+          cff_write(
+            keys = list(
+              references = as.list(as_cff(cit))
+            )
+          )
           REOF
           WORK_DIR="${WORK_DIR}" Rscript "${R_SCRIPT}"
           rm -f "${R_SCRIPT}"
@@ -161,8 +179,10 @@ jobs:
           # ── Base64-encode the generated file ──
           base64 -w0 < "${WORK_DIR}/CITATION.cff" > "${NEW_CFF_B64_FILE}"
 
-          echo "work_dir=${WORK_DIR}"             >> "${GITHUB_OUTPUT}"
-          echo "new_cff_b64_file=${NEW_CFF_B64_FILE}" >> "${GITHUB_OUTPUT}"
+          echo "work_dir=${WORK_DIR}"                     >> "${GITHUB_OUTPUT}"
+          echo "new_cff_b64_file=${NEW_CFF_B64_FILE}"     >> "${GITHUB_OUTPUT}"
+          echo "cff_exists=${CFF_EXISTS}"                 >> "${GITHUB_OUTPUT}"
+          echo "existing_cff_sha=${EXISTING_CFF_SHA}"     >> "${GITHUB_OUTPUT}"
 
       # -----------------------------------------------------------------------
       # 4. Create new PR (real run)
@@ -179,13 +199,21 @@ jobs:
           TARGET_BRANCH: ${{ inputs.branch }}
           WORK_DIR: ${{ steps.generate.outputs.work_dir }}
           NEW_CFF_B64_FILE: ${{ steps.generate.outputs.new_cff_b64_file }}
+          CFF_EXISTS: ${{ steps.generate.outputs.cff_exists }}
+          EXISTING_CFF_SHA: ${{ steps.generate.outputs.existing_cff_sha }}
         run: |
           set -euo pipefail
           REPO="${{ inputs.repo }}"
 
-          BRANCH="ci/add-citation-cff-${{ github.run_id }}"
+          if [ "${CFF_EXISTS}" = "true" ]; then
+            ACTION="Update"
+          else
+            ACTION="Add"
+          fi
 
-          # ── Create the branch and add CITATION.cff in one commit ──
+          BRANCH="ci/update-citation-cff-${{ github.run_id }}"
+
+          # ── Create the branch off the target branch ──
           BASE_SHA=$(gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" \
                        --jq '.commit.sha')
           gh api "repos/${ORG}/${REPO}/git/refs" \
@@ -194,15 +222,21 @@ jobs:
             --field "sha=${BASE_SHA}"
           echo "  Created branch: ${BRANCH} (off ${TARGET_BRANCH})"
 
-          if ! gh api "repos/${ORG}/${REPO}/contents/CITATION.cff" \
-            --method PUT \
-            --field "message=Add CITATION.cff" \
-            --field "content=$(cat "${NEW_CFF_B64_FILE}")" \
-            --field "branch=${BRANCH}"; then
+          # ── Commit CITATION.cff (include SHA when updating an existing file) ──
+          PUT_ARGS=(
+            --method PUT
+            --field "message=${ACTION} CITATION.cff"
+            --field "content=$(cat "${NEW_CFF_B64_FILE}")"
+            --field "branch=${BRANCH}"
+          )
+          if [ "${CFF_EXISTS}" = "true" ]; then
+            PUT_ARGS+=(--field "sha=${EXISTING_CFF_SHA}")
+          fi
+          if ! gh api "repos/${ORG}/${REPO}/contents/CITATION.cff" "${PUT_ARGS[@]}"; then
             echo "::error::Failed to commit CITATION.cff to ${BRANCH} in ${ORG}/${REPO}. Check that AUDIT_PAT has write access."
             exit 1
           fi
-          echo "  Added CITATION.cff"
+          echo "  ${ACTION}d CITATION.cff"
 
           # ── Build PR body ──
           PR_BODY_FILE=$(mktemp)
@@ -219,7 +253,7 @@ jobs:
             --repo "${ORG}/${REPO}" \
             --base "${TARGET_BRANCH}" \
             --head "${BRANCH}" \
-            --title "Add CITATION.cff" \
+            --title "${ACTION} CITATION.cff" \
             --body-file "${PR_BODY_FILE}"
 
           rm -rf "${WORK_DIR}"
@@ -236,9 +270,14 @@ jobs:
           inputs.dry_run == true
         env:
           WORK_DIR: ${{ steps.generate.outputs.work_dir }}
+          CFF_EXISTS: ${{ steps.generate.outputs.cff_exists }}
         run: |
           REPO="${{ inputs.repo }}"
-          echo "::notice::DRY RUN – would add CITATION.cff to ${REPO} targeting '${{ inputs.branch }}'."
+          if [ "${CFF_EXISTS}" = "true" ]; then
+            echo "::notice::DRY RUN – would update CITATION.cff in ${REPO} targeting '${{ inputs.branch }}'."
+          else
+            echo "::notice::DRY RUN – would add CITATION.cff to ${REPO} targeting '${{ inputs.branch }}'."
+          fi
           echo "==> Generated CITATION.cff:"
           cat "${WORK_DIR}/CITATION.cff"
           rm -rf "${WORK_DIR}"
