@@ -112,7 +112,9 @@ jobs:
           packages: ""
           extra-packages: |
             any::cffr
-            any::V8  # required by cffr for JavaScript-based CFF validation
+            any::V8
+          cache-version: 1
+          lockfile-create: false
 
       # -----------------------------------------------------------------------
       # 3. Generate CITATION.cff via cffr::cff_write()
