@@ -124,6 +124,49 @@ in one place.
 
 ---
 
+### 3. Add or update CITATION.cff (`update-citation-cff.yml`)
+
+Generates (or refreshes) a `CITATION.cff` file in a target repository using
+the [cffr](https://docs.ropensci.org/cffr/) R package.  Citation metadata is
+derived from the package `DESCRIPTION`, and the automatic software citation is
+also included as a `references` entry so that both the preferred citation and
+the software citation are present.
+
+#### What the workflow does
+
+- Runs `cffr::cff_write()` with the auto-citation from `citation(".", auto = TRUE)`
+  passed as the `references` key.
+- If `inst/CITATION` exists in the target repository it is automatically used
+  by `cff_write()` as the `preferred-citation`.
+- **First run:** opens a PR that *adds* `CITATION.cff`.
+- **Subsequent runs:** opens a PR that *updates* the existing `CITATION.cff`
+  (minor changes such as `year:` and `notes:` are expected).
+
+#### Eligibility checks (a repo is skipped when …)
+
+| Condition | Action |
+|-----------|--------|
+| Not found / not accessible | Error |
+| Is a fork | Skip |
+| Is archived | Skip |
+| Target branch not found | Skip |
+| No `DESCRIPTION` on target branch | Skip (not an R package) |
+
+#### Running the workflow
+
+1. Go to **Actions → Add or update CITATION.cff for a package** in this repository.
+2. Click **Run workflow**.
+3. Fill in the inputs:
+   - **`repo`** *(required)* – repository name within the organisation,
+     e.g. `MultiAssayExperiment`.
+   - **`branch`** *(optional, default `devel`)* – target branch,
+     e.g. `devel` or `RELEASE_3_22`.
+   - **`dry_run`** *(optional, default `false`)* – when `true`, the workflow
+     performs all checks and prints the generated `CITATION.cff`, but does
+     **not** push any branch or open a PR.
+
+---
+
 ## Required secret
 
 Both workflows use a secret named **`AUDIT_PAT`** – a GitHub
@@ -145,11 +188,13 @@ it can create branches, commit, and open pull requests.
   workflows/
     audit-single-repo-funding.yml   # Audit 1: add missing fnd entries to DESCRIPTION
     migrate-pr-check-to-ci.yml      # Audit 2: replace pr_check.yml with ci.yml wrapper
+    update-citation-cff.yml         # Audit 3: add or update CITATION.cff
 scripts/
   audit_single_repo.R               # R script: parses/updates Authors@R
   ci.yml                            # ci.yml template copied to target repos
   migrate-pr-check-pr-body.md       # PR body template for the migration audit
   nih_institutes.json               # NIH institute code → agency name map
+  update-citation-cff-pr-body.md    # PR body template for the CITATION.cff audit
 README.md
 ```
 

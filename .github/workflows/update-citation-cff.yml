@@ -5,7 +5,7 @@ on:
     inputs:
       repo:
         description: >
-          Repository name within the waldronlab organisation to add or update
+          Repository name within the organisation to add or update
           CITATION.cff for (e.g. MultiAssayExperiment)
         required: true
         type: string
