@@ -66,6 +66,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.AUDIT_PAT }}
           TARGET_BRANCH: ${{ inputs.branch }}
+        shell: bash
         run: |
           set -euo pipefail
           REPO="${{ inputs.repo }}"
@@ -120,7 +121,7 @@ jobs:
         shell: Rscript {0}
         run: |
           options(repos = c(CRAN = Sys.getenv("CRAN")))
-          BiocManager::install(c("cffr", "V8"), ask = FALSE)
+          BiocManager::install(c("remotes", "cffr", "V8"), ask = FALSE)
 
       # -----------------------------------------------------------------------
       # 3. Generate CITATION.cff via cffr::cff_write()
@@ -137,6 +138,7 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.AUDIT_PAT }}
           TARGET_BRANCH: ${{ inputs.branch }}
+        shell: bash
         run: |
           set -euo pipefail
           REPO="${{ inputs.repo }}"
@@ -175,14 +177,17 @@ jobs:
           pkg      <- Sys.getenv("PKG_NAME")
 
           # Install the package from the local clone so that citation() can
-          # find it by name.  --no-test-load avoids load-time errors from
-          # missing optional dependencies; --no-build-vignettes skips vignette
-          # compilation (which could fail) since we only need the package
-          # metadata accessible for citation().
-          options(repos = c(CRAN = Sys.getenv("CRAN")))
-          install.packages(
-            work_dir, repos = NULL, type = "source",
-            INSTALL_opts = c("--no-test-load", "--no-build-vignettes")
+          # find it by name.  remotes::install_local resolves and installs
+          # dependencies from Bioconductor repositories; --no-test-load avoids
+          # load-time errors from missing optional dependencies;
+          # --no-build-vignettes skips vignette compilation (which could fail)
+          # since we only need the package metadata accessible for citation().
+          options(repos = BiocManager::repositories())
+          remotes::install_local(
+            work_dir,
+            repos = BiocManager::repositories(),
+            INSTALL_opts = c("--no-test-load", "--no-build-vignettes"),
+            upgrade = "never"
           )
 
           # Generate and write CITATION.cff from the installed package.
@@ -226,6 +231,7 @@ jobs:
           NEW_CFF_B64_FILE: ${{ steps.generate.outputs.new_cff_b64_file }}
           CFF_EXISTS: ${{ steps.generate.outputs.cff_exists }}
           EXISTING_CFF_SHA: ${{ steps.generate.outputs.existing_cff_sha }}
+        shell: bash
         run: |
           set -euo pipefail
           REPO="${{ inputs.repo }}"
