@@ -26,16 +26,33 @@ on:
 
 env:
   ORG: waldronlab
+  CRAN: "https://p3m.dev/cran/__linux__/noble/latest"
 
 jobs:
   update-citation-cff:
     runs-on: ubuntu-latest
+    container: ghcr.io/bioconductor/bioconductor_docker:devel
     permissions:
       contents: read
 
     steps:
       # -----------------------------------------------------------------------
-      # 0. Checkout repo-audits@devel so scripts/ are available locally
+      # 0a. Install system tools (gh CLI, jq) not present in the container
+      # -----------------------------------------------------------------------
+      - name: Install system tools
+        run: |
+          apt-get update -qq
+          apt-get install -y --no-install-recommends jq curl
+          curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+            | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+          chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+            | tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+          apt-get update -qq
+          apt-get install -y gh
+
+      # -----------------------------------------------------------------------
+      # 0b. Checkout repo-audits@devel so scripts/ are available locally
       # -----------------------------------------------------------------------
       - uses: actions/checkout@v4
         with:
@@ -96,33 +113,23 @@ jobs:
           echo "==> ${REPO} is eligible – CITATION.cff will be added or updated."
 
       # -----------------------------------------------------------------------
-      # 2. Set up R (only when we will actually run)
+      # 2. Install R packages required for CFF generation
       # -----------------------------------------------------------------------
-      - uses: r-lib/actions/setup-r@v2
+      - name: Install R packages
         if: steps.check.outputs.skip == 'false'
-        with:
-          use-public-rspm: true
-
-      - uses: r-lib/actions/setup-r-dependencies@v2
-        if: steps.check.outputs.skip == 'false'
-        with:
-          # packages: "" prevents setup-r-dependencies from looking for a
-          # DESCRIPTION in the repo-audits checkout directory (which has none).
-          # Only the explicitly listed extra-packages are installed.
-          packages: ""
-          extra-packages: |
-            any::cffr
-            any::V8
-          cache-version: 1
-          lockfile-create: false
+        shell: Rscript {0}
+        run: |
+          options(repos = c(CRAN = Sys.getenv("CRAN")))
+          install.packages(c("cffr", "V8"))
 
       # -----------------------------------------------------------------------
       # 3. Generate CITATION.cff via cffr::cff_write()
       #
-      #    The auto-citation (derived from DESCRIPTION) is included as a
-      #    references entry so both the preferred-citation (from inst/CITATION
-      #    if present, otherwise from DESCRIPTION) and the software citation
-      #    appear in CITATION.cff.
+      #    The target package is installed from the cloned source first so
+      #    that citation() can locate it, then cff_write() is called with the
+      #    package name.  The auto-citation (derived from DESCRIPTION) is
+      #    included as a references entry so both the preferred-citation and
+      #    the software citation appear in CITATION.cff.
       # -----------------------------------------------------------------------
       - name: Generate CITATION.cff
         id: generate
@@ -156,25 +163,41 @@ jobs:
             CFF_EXISTS=false
           fi
 
-          # ── Generate CITATION.cff ──
+          # ── Get the package name from DESCRIPTION ──
+          PKG_NAME=$(grep '^Package:' "${WORK_DIR}/DESCRIPTION" | sed 's/^Package:[[:space:]]*//')
+          echo "  Package name: ${PKG_NAME}"
+
+          # ── Install the package and generate CITATION.cff ──
           R_SCRIPT=$(mktemp --suffix=.R)
           cat > "${R_SCRIPT}" << 'REOF'
           library(cffr)
-          setwd(Sys.getenv("WORK_DIR"))
+          work_dir <- Sys.getenv("WORK_DIR")
+          pkg      <- Sys.getenv("PKG_NAME")
 
-          # Include the auto-citation from DESCRIPTION as a references entry.
-          # citation(".", auto = TRUE) reads DESCRIPTION from the current directory
-          # without requiring the package to be installed.
-          # as_cff() converts the bibentry to CFF format; as.list() ensures the
-          # result is properly nested as individual entries under "references".
-          cit <- citation(".", auto = TRUE)
+          # Install the package from the local clone so that citation() can
+          # find it by name.  --no-test-load avoids load-time errors from
+          # missing optional dependencies; --no-build-vignettes skips vignette
+          # compilation (which could fail) since we only need the package
+          # metadata accessible for citation().
+          options(repos = c(CRAN = Sys.getenv("CRAN")))
+          install.packages(
+            work_dir, repos = NULL, type = "source",
+            INSTALL_opts = c("--no-test-load", "--no-build-vignettes")
+          )
+
+          # Generate and write CITATION.cff from the installed package.
+          # citation(pkg, auto = TRUE) auto-generates from DESCRIPTION when no
+          # inst/CITATION is present; as_cff() converts to CFF format.
+          setwd(work_dir)
+          cit <- citation(pkg, auto = TRUE)
           cff_write(
+            pkg,
             keys = list(
               references = as.list(as_cff(cit))
             )
           )
           REOF
-          WORK_DIR="${WORK_DIR}" Rscript "${R_SCRIPT}"
+          WORK_DIR="${WORK_DIR}" PKG_NAME="${PKG_NAME}" CRAN="${CRAN}" Rscript "${R_SCRIPT}"
           rm -f "${R_SCRIPT}"
           echo "  Generated CITATION.cff"
 
