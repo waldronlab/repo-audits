@@ -120,7 +120,7 @@ jobs:
         shell: Rscript {0}
         run: |
           options(repos = c(CRAN = Sys.getenv("CRAN")))
-          install.packages(c("cffr", "V8"))
+          BiocManager::install(c("cffr", "V8"), ask = FALSE)
 
       # -----------------------------------------------------------------------
       # 3. Generate CITATION.cff via cffr::cff_write()
