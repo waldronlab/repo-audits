@@ -182,7 +182,6 @@ jobs:
           # load-time errors from missing optional dependencies;
           # --no-build-vignettes skips vignette compilation (which could fail)
           # since we only need the package metadata accessible for citation().
-          options(repos = BiocManager::repositories())
           remotes::install_local(
             work_dir,
             repos = BiocManager::repositories(),
