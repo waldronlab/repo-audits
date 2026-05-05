@@ -165,6 +165,8 @@ the software citation are present.
      performs all checks and prints the generated `CITATION.cff`, but does
      **not** push any branch or open a PR.
 
+> Part of this work was initiated and written at the 2026 Software Citation Workshop, which was supported by the NASA TWSC program under award number 316634-00001.
+
 ---
 
 ## Required secret
