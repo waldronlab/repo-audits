@@ -178,15 +178,12 @@ jobs:
 
           # Install the package from the local clone so that citation() can
           # find it by name.  remotes::install_local resolves and installs
-          # dependencies from Bioconductor repositories; --no-test-load avoids
-          # load-time errors from missing optional dependencies;
-          # --no-build-vignettes skips vignette compilation (which could fail)
-          # since we only need the package metadata accessible for citation().
+          # dependencies from Bioconductor repositories
           options(repos = c(CRAN = Sys.getenv("CRAN")))
           remotes::install_local(
             work_dir,
             repos = BiocManager::repositories(),
-            INSTALL_opts = c("--no-test-load", "--no-build-vignettes"),
+            INSTALL_opts = c("--no-test-load", "--no-staged-install"),
             upgrade = "never"
           )
 
