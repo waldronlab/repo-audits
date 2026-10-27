@@ -1,9 +1,9 @@
 This automated PR adds a `.github/workflows/ci.yml` wrapper that delegates to
-the shared reusable workflow in
-[waldronlab/.github](https://github.com/waldronlab/.github).
+the recommended reusable workflow in
+[Bioconductor/workflows](https://github.com/Bioconductor/workflows/blob/main/.github/workflows/bioccheck.yml).
 
 ## Changes
-- **Added** `.github/workflows/ci.yml` – calls `waldronlab/.github/.github/workflows/bioc-pr-cmdcheck-pkgdown.yml@<version>`
+- **Added** `.github/workflows/ci.yml` – calls `Bioconductor/workflows/.github/workflows/bioccheck.yml@<ref>`
 
 ## Why
 Using the centralized reusable workflow means future CI fixes and improvements
@@ -16,7 +16,6 @@ parameters that you can edit to suit your package:
 
 | Parameter | Default | Description |
 |---|---|---|
-| `enable_pkgdown` | `true` | Build and deploy a pkgdown site on RELEASE_* branch pushes |
-| `enable_docker` | `true` | Build and push a Docker image on devel pushes (requires a Dockerfile) |
-| `dockerfile_path` | `inst/docker/pkg/Dockerfile` | Path to the Dockerfile |
-| `cran` | *(workflow default)* | CRAN-like repository URL used to install packages |
+| `enable_pkgdown` | `true` | Build and deploy a pkgdown site |
+| `enable_cyclocomp` | `false` | Run cyclomatic complexity analysis |
+| `error_on` | `warning` | rcmdcheck error policy (never, note, warning, error) |
