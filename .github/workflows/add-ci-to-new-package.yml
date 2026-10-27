@@ -1,4 +1,4 @@
-name: Add ci.yml to new package
+name: Add or update ci.yml (Bioconductor/workflows)
 
 on:
   workflow_dispatch:
@@ -16,45 +16,33 @@ on:
         required: false
         type: string
         default: devel
-      workflow_version:
+      workflow_ref:
         description: >
-          Version tag of the reusable workflow to reference in ci.yml
-          (e.g. devel, v1). This becomes the @<version> suffix in the
-          `uses:` line of the generated ci.yml.
+          Ref (branch or tag) of Bioconductor/workflows to reference in the
+          `uses:` line (e.g. main). Applies to both new and existing ci files.
         required: false
         type: string
-        default: devel
+        default: main
       enable_pkgdown:
         description: >
-          If true, build and deploy pkgdown when on a RELEASE_* branch push.
-          Passed as `enable_pkgdown:` in the generated ci.yml with: block.
+          New ci.yml only: passed as `enable_pkgdown:` in the with: block.
+          Existing workflows keep their current value.
         required: false
         type: boolean
         default: true
-      enable_docker:
+      enable_cyclocomp:
         description: >
-          If true, build and push a Docker image when a Dockerfile exists and
-          on a devel push. Passed as `enable_docker:` in the generated ci.yml
-          with: block.
+          New ci.yml only: passed as `enable_cyclocomp:` in the with: block.
         required: false
         type: boolean
-        default: true
-      dockerfile_path:
+        default: false
+      error_on:
         description: >
-          Path to the Dockerfile to build (relative to the repository root).
-          Passed as `dockerfile_path:` in the generated ci.yml with: block.
+          New ci.yml only: rcmdcheck error policy (never, note, warning, error).
         required: false
-        type: string
-        default: inst/docker/pkg/Dockerfile
-      cran:
-        description: >
-          CRAN-like repository URL to use for package installation. Leave
-          blank to use the reusable workflow default
-          (https://p3m.dev/cran/__linux__/noble/latest).
-          If non-empty, passed as `cran:` in the generated ci.yml with: block.
-        required: false
-        type: string
-        default: ''
+        type: choice
+        options: [never, note, warning, error]
+        default: warning
       dry_run:
         description: >
           Dry run – perform all checks and show what would change,
@@ -80,21 +68,22 @@ jobs:
         with:
           ref: devel
 
+
       # -----------------------------------------------------------------------
-      # 1. Check eligibility of the target repository
+      # 1. Check eligibility and decide whether to add or update
       # -----------------------------------------------------------------------
       - name: Check eligibility
         id: check
         env:
           GH_TOKEN: ${{ secrets.AUDIT_PAT }}
           TARGET_BRANCH: ${{ inputs.branch }}
+          NEW_USES_PREFIX: Bioconductor/workflows/.github/workflows/bioccheck.yml
         run: |
           set -euo pipefail
           REPO="${{ inputs.repo }}"
 
           echo "==> Checking ${ORG}/${REPO} …"
 
-          # --- Fetch repo metadata -------------------------------------------
           if ! REPO_JSON=$(gh api "repos/${ORG}/${REPO}" 2>&1); then
             echo "::error::Repository ${ORG}/${REPO} not found or not accessible."
             exit 1
@@ -103,47 +92,67 @@ jobs:
           IS_FORK=$(echo "${REPO_JSON}"     | jq -r '.fork')
           IS_ARCHIVED=$(echo "${REPO_JSON}" | jq -r '.archived')
 
-          if [ "${IS_FORK}" = "true" ]; then
-            echo "::notice::Skipping ${REPO} – it is a fork."
+          skip() {
+            echo "::notice::Skipping ${REPO} – $1"
             echo "skip=true" >> "${GITHUB_OUTPUT}"
             exit 0
-          fi
+          }
 
-          if [ "${IS_ARCHIVED}" = "true" ]; then
-            echo "::notice::Skipping ${REPO} – it is archived."
-            echo "skip=true" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
+          [ "${IS_FORK}" = "true" ]     && skip "it is a fork."
+          [ "${IS_ARCHIVED}" = "true" ] && skip "it is archived."
 
-          # Require the target branch to exist
           if ! gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" > /dev/null 2>&1; then
-            echo "::notice::Skipping ${REPO} – branch '${TARGET_BRANCH}' not found."
-            echo "skip=true" >> "${GITHUB_OUTPUT}"
-            exit 0
+            skip "branch '${TARGET_BRANCH}' not found."
           fi
 
-          # Skip if ci.yml already exists on the target branch
-          if gh api \
-            "repos/${ORG}/${REPO}/contents/.github/workflows/ci.yml?ref=${TARGET_BRANCH}" \
-            > /dev/null 2>&1; then
-            echo "::notice::Skipping ${REPO} – ci.yml already exists on '${TARGET_BRANCH}'."
-            echo "skip=true" >> "${GITHUB_OUTPUT}"
-            exit 0
-          fi
-
-          # Skip if an add-ci PR already exists
+          # Skip if an open PR from this workflow already exists
           EXISTING_PR=$(gh pr list \
             --repo "${ORG}/${REPO}" \
             --state open \
-            --search "Add ci.yml in:title" \
+            --search "Bioconductor/workflows in:title" \
             --json number \
             --jq '.[0].number' 2>/dev/null || true)
           if [ -n "${EXISTING_PR}" ]; then
-            echo "::notice::Skipping ${REPO} – add-ci PR #${EXISTING_PR} already open."
-            echo "skip=true" >> "${GITHUB_OUTPUT}"
+            skip "PR #${EXISTING_PR} already open."
+          fi
+
+          # Scan existing workflow files for references to the reusable workflow
+          WF_LIST=$(gh api \
+            "repos/${ORG}/${REPO}/contents/.github/workflows?ref=${TARGET_BRANCH}" \
+            --jq '.[] | select(.type=="file") | select(.name | test("\\.ya?ml$")) | .name' \
+            2>/dev/null || true)
+
+          TO_UPDATE=""
+          ALREADY_NEW=""
+          for F in ${WF_LIST}; do
+            CONTENT=$(gh api \
+              "repos/${ORG}/${REPO}/contents/.github/workflows/${F}?ref=${TARGET_BRANCH}" \
+              --jq '.content' | base64 -d)
+            if printf '%s\n' "${CONTENT}" | grep -Eq 'uses:[[:space:]]*waldronlab/\.github/\.github/workflows/'; then
+              TO_UPDATE="${TO_UPDATE} ${F}"
+            elif printf '%s\n' "${CONTENT}" | grep -Fq "${NEW_USES_PREFIX}"; then
+              ALREADY_NEW="${ALREADY_NEW} ${F}"
+            fi
+          done
+
+          if [ -n "${TO_UPDATE}" ]; then
+            echo "mode=update" >> "${GITHUB_OUTPUT}"
+            echo "files=${TO_UPDATE# }" >> "${GITHUB_OUTPUT}"
+            echo "skip=false" >> "${GITHUB_OUTPUT}"
+            echo "==> ${REPO}: will update:${TO_UPDATE}"
             exit 0
           fi
 
+          if [ -n "${ALREADY_NEW}" ]; then
+            skip "already uses Bioconductor/workflows (${ALREADY_NEW# })."
+          fi
+
+          if echo "${WF_LIST}" | grep -qx 'ci.yml'; then
+            skip "ci.yml exists but does not reference a shared reusable workflow; review manually."
+          fi
+
+          echo "mode=add" >> "${GITHUB_OUTPUT}"
+          echo "files=ci.yml" >> "${GITHUB_OUTPUT}"
           echo "skip=false" >> "${GITHUB_OUTPUT}"
           echo "==> ${REPO} is eligible – ci.yml will be added."
 
@@ -157,98 +166,104 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.AUDIT_PAT }}
           TARGET_BRANCH: ${{ inputs.branch }}
-          WORKFLOW_VERSION: ${{ inputs.workflow_version }}
+          WORKFLOW_REF: ${{ inputs.workflow_ref }}
           ENABLE_PKGDOWN: ${{ inputs.enable_pkgdown }}
-          ENABLE_DOCKER: ${{ inputs.enable_docker }}
-          DOCKERFILE_PATH: ${{ inputs.dockerfile_path }}
-          CRAN: ${{ inputs.cran }}
+          ENABLE_CYCLOCOMP: ${{ inputs.enable_cyclocomp }}
+          ERROR_ON: ${{ inputs.error_on }}
+          MODE: ${{ steps.check.outputs.mode }}
+          FILES: ${{ steps.check.outputs.files }}
         run: |
           set -euo pipefail
           REPO="${{ inputs.repo }}"
-          BRANCH="ci/add-ci-yml-${{ github.run_id }}"
+          BRANCH="ci/bioconductor-workflows-${{ github.run_id }}"
+          NEW_USES="Bioconductor/workflows/.github/workflows/bioccheck.yml@${WORKFLOW_REF}"
 
-          # ── Validate string inputs won't break YAML ──
-          for VAR in DOCKERFILE_PATH CRAN; do
-            VAL="${!VAR}"
-            if [[ "${VAL}" == *$'\n'* || "${VAL}" == *$'\r'* ]]; then
-              echo "::error::Input '${VAR}' must not contain newline characters."
-              exit 1
-            fi
-          done
-
-          # ── Build the with: block; cran is optional ──
-          WITH_PARAMS=""
-          if [ -n "${CRAN}" ]; then
-            WITH_PARAMS="${WITH_PARAMS}      cran: ${CRAN}\n"
+          if [[ ! "${WORKFLOW_REF}" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+            echo "::error::Invalid workflow_ref '${WORKFLOW_REF}'."
+            exit 1
           fi
-          WITH_PARAMS="${WITH_PARAMS}      enable_pkgdown: ${ENABLE_PKGDOWN}\n"
-          WITH_PARAMS="${WITH_PARAMS}      enable_docker: ${ENABLE_DOCKER}\n"
-          WITH_PARAMS="${WITH_PARAMS}      dockerfile_path: ${DOCKERFILE_PATH}"
 
-          # ── Generate ci.yml content ──
-          CI_YML_CONTENT=$(printf '%s\n' \
-            'name: PR CMD check & build site' \
-            '' \
-            'on:' \
-            '  pull_request:' \
-            '  push:' \
-            '    paths:' \
-            "      - 'DESCRIPTION'" \
-            "      - '**.yml'" \
-            '    branches:' \
-            '      - devel' \
-            "      - 'RELEASE_*'" \
-            '' \
-            'jobs:' \
-            '  ci:' \
-            "    uses: waldronlab/.github/.github/workflows/bioc-pr-cmdcheck-pkgdown.yml@${WORKFLOW_VERSION}" \
-            '    with:' \
-            "$(printf '%b' "${WITH_PARAMS}")" \
-            '    secrets: inherit' \
-            '    permissions:' \
-            '      contents: write' \
-            '      pages: write' \
-            '      id-token: write')
-          CI_YML=$(printf '%s' "${CI_YML_CONTENT}" | base64 -w0)
-
-          # ── Create a branch off the target branch ──
           BASE_SHA=$(gh api "repos/${ORG}/${REPO}/branches/${TARGET_BRANCH}" \
                        --jq '.commit.sha')
-
           gh api "repos/${ORG}/${REPO}/git/refs" \
             --method POST \
             --field "ref=refs/heads/${BRANCH}" \
             --field "sha=${BASE_SHA}"
           echo "  Created branch: ${BRANCH} (off ${TARGET_BRANCH})"
 
-          # ── Add ci.yml ──
-          gh api "repos/${ORG}/${REPO}/contents/.github/workflows/ci.yml" \
-            --method PUT \
-            --field "message=Add ci.yml reusable-workflow wrapper" \
-            --field "content=${CI_YML}" \
-            --field "branch=${BRANCH}"
-          echo "  Added .github/workflows/ci.yml"
+          if [ "${MODE}" = "add" ]; then
+            printf '%s\n' \
+              'name: PR CMD check & build site' \
+              '' \
+              'on:' \
+              '  pull_request:' \
+              '  push:' \
+              '    paths:' \
+              "      - 'DESCRIPTION'" \
+              "      - '**.yml'" \
+              '    branches:' \
+              '      - devel' \
+              "      - 'RELEASE_*'" \
+              '' \
+              'jobs:' \
+              '  ci:' \
+              "    uses: ${NEW_USES}" \
+              '    with:' \
+              "      enable_pkgdown: ${ENABLE_PKGDOWN}" \
+              "      enable_cyclocomp: ${ENABLE_CYCLOCOMP}" \
+              "      error_on: '${ERROR_ON}'" \
+              '    secrets: inherit' \
+              '    permissions:' \
+              '      contents: write' \
+              '      pages: write' \
+              '      id-token: write' > ci.yml.new
+            CI_YML=$(base64 -w0 ci.yml.new)
+            gh api "repos/${ORG}/${REPO}/contents/.github/workflows/ci.yml" \
+              --method PUT \
+              --field "message=Add ci.yml calling Bioconductor/workflows" \
+              --field "content=${CI_YML}" \
+              --field "branch=${BRANCH}"
+            echo "  Added .github/workflows/ci.yml"
+            BODY_SRC=scripts/add-ci-pr-body.md
+            TITLE="Add ci.yml using Bioconductor/workflows bioccheck"
+          else
+            for F in ${FILES}; do
+              API="repos/${ORG}/${REPO}/contents/.github/workflows/${F}"
+              META=$(gh api "${API}?ref=${BRANCH}")
+              SHA=$(echo "${META}" | jq -r '.sha')
+              echo "${META}" | jq -r '.content' | base64 -d > "wf.yml"
+              RESULT=$(python3 scripts/update_ci_reference.py wf.yml "${NEW_USES}")
+              if [ "${RESULT}" = "changed" ]; then
+                gh api "${API}" \
+                  --method PUT \
+                  --field "message=Update ${F} to use Bioconductor/workflows bioccheck" \
+                  --field "content=$(base64 -w0 wf.yml)" \
+                  --field "sha=${SHA}" \
+                  --field "branch=${BRANCH}"
+                echo "  Updated .github/workflows/${F}"
+              fi
+            done
+            BODY_SRC=scripts/update-ci-pr-body.md
+            TITLE="Update CI to use Bioconductor/workflows bioccheck"
+          fi
 
-          # ── Build PR body ──
           PR_BODY_FILE=$(mktemp)
-          cp scripts/add-ci-pr-body.md "${PR_BODY_FILE}"
+          cp "${BODY_SRC}" "${PR_BODY_FILE}"
           printf '\nOpened by the [repo-audits](https://github.com/waldronlab/repo-audits) workflow (run [#%s](%s/%s/actions/runs/%s)).\n' \
             "${{ github.run_id }}" \
             "${{ github.server_url }}" \
             "${{ github.repository }}" \
             "${{ github.run_id }}" >> "${PR_BODY_FILE}"
 
-          # ── Open PR ──
           gh pr create \
             --repo "${ORG}/${REPO}" \
             --base "${TARGET_BRANCH}" \
             --head "${BRANCH}" \
-            --title "Add ci.yml reusable-workflow wrapper" \
+            --title "${TITLE}" \
             --body-file "${PR_BODY_FILE}"
 
           rm -f "${PR_BODY_FILE}"
-
-          echo "::notice::PR created in ${ORG}/${REPO} targeting '${TARGET_BRANCH}' (branch: ${BRANCH}, version: ${WORKFLOW_VERSION}, enable_pkgdown: ${ENABLE_PKGDOWN}, enable_docker: ${ENABLE_DOCKER}, dockerfile_path: ${DOCKERFILE_PATH})."
+          echo "::notice::PR (${MODE}) created in ${ORG}/${REPO} targeting '${TARGET_BRANCH}' (branch: ${BRANCH}, uses: ${NEW_USES})."
 
       # -----------------------------------------------------------------------
       # 3. Dry-run summary
@@ -258,14 +273,10 @@ jobs:
           steps.check.outputs.skip == 'false' &&
           inputs.dry_run == true
         env:
-          CRAN_MSG: ${{ inputs.cran != '' && format(', cran={0}', inputs.cran) || '' }}
+          MODE: ${{ steps.check.outputs.mode }}
+          FILES: ${{ steps.check.outputs.files }}
         run: |
-          echo "::notice::DRY RUN – would create add-ci PR in \
-          ${{ inputs.repo }} targeting '${{ inputs.branch }}' \
-          with workflow version '${{ inputs.workflow_version }}', \
-          enable_pkgdown=${{ inputs.enable_pkgdown }}, \
-          enable_docker=${{ inputs.enable_docker }}, \
-          dockerfile_path='${{ inputs.dockerfile_path }}'${CRAN_MSG}."
+          echo "::notice::DRY RUN – would ${MODE} (${FILES}) in ${{ inputs.repo }} targeting '${{ inputs.branch }}' using Bioconductor/workflows/.github/workflows/bioccheck.yml@${{ inputs.workflow_ref }}."
 
       # -----------------------------------------------------------------------
       # 4. Nothing to do
@@ -273,4 +284,4 @@ jobs:
       - name: No action needed
         if: steps.check.outputs.skip == 'true'
         run: |
-          echo "::notice::${{ inputs.repo }} does not need ci.yml added – skipped."
+          echo "::notice::${{ inputs.repo }} needs no change – skipped."
